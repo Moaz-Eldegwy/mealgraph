@@ -7,7 +7,9 @@ from IPython.display import Markdown, display
 
 from agents import CoachAgent, MedicalAssessmentAgent, PlannerAgent
 from config import set_settings
+from knowledge import KnowledgeAgent
 from logging_setup import get_logger, refresh_level
+from memory import LongTermMemory
 from state import initialize_empty_memory
 from tools import ComputationTool, QuantitiesFinder, WebSearchTool
 from utils import APIPoolManager, create_llm
@@ -187,7 +189,29 @@ def initialize_agents():
             PLANNER_LLM, TOOLS["ComputationTool"], TOOLS["WebSearchTool"], TOOLS["QuantitiesFinder"]
         ),
         "ValidationAgent": ValidationAgent(VALIDATION_LLM),
+        # KnowledgeAgent is the citation-first retrieval seam; defaults to
+        # WebSearch backing. Phase 3+ can swap in a RAG-backed implementation
+        # over USDA / WHO / ADA / EFSA without touching Coach call-sites.
+        "KnowledgeAgent": KnowledgeAgent(TOOLS["WebSearchTool"]),
     }
+
+
+# ---------------------------------------------------------------------------
+# Long-term memory singleton (Phase 3)
+# ---------------------------------------------------------------------------
+LONG_TERM_MEMORY: Optional[LongTermMemory] = None
+
+
+def initialize_long_term_memory(db_path: Optional[str] = None) -> LongTermMemory:
+    """Initialise the SQLite-backed three-tier memory.
+
+    Pass a file path for cross-session persistence, or omit for an in-memory
+    DB (default; tests / ephemeral demos).
+    """
+    global LONG_TERM_MEMORY
+    LONG_TERM_MEMORY = LongTermMemory(db_path=db_path)
+    _logger.info("Long-term memory initialised at %s", db_path or ":memory:")
+    return LONG_TERM_MEMORY
 
 def setup_workflow():
     global APP
