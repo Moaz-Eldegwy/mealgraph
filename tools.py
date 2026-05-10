@@ -1,27 +1,25 @@
 """Tools layer.
 
-Phase 1 cleanup notes:
+Phase 1: prints -> namespaced loggers; settings via :func:`config.get_settings`.
 
-* Replaced ``print`` with namespaced loggers so user-mode emoji output is
-  filterable and the API/UI in Phase 7 can subscribe to it as events.
-* Reads ``settings.debug_mode`` via :func:`config.get_settings` instead of the
-  legacy module-level globals.
-
-The :class:`ComputationTool` still shells out to ``subprocess.run(['python', ...])``
-- **this is a known security issue**, fixed in Phase 4 by either deterministic
-formula functions or a ``RestrictedPython`` sandbox.
+Phase 4 (safety):
+    * :class:`ComputationTool` no longer shells out to ``subprocess.run(['python', ...])``.
+      It now dispatches to closed-form clinical formulas (``nutrition_formulas``)
+      for the standard cases (BMI / BMR / TDEE / calorie target / macro split)
+      and falls back to an AST-restricted math evaluator for arbitrary numeric
+      expressions. **Closes the remote-code-execution vector.**
+    * No subprocess, no eval, no exec, no file/network access from the tool.
 """
 
 from __future__ import annotations
 
+import ast
 import json
-import os
+import operator as op
 import re
-import subprocess
-import tempfile
 from datetime import datetime
 from time import sleep
-from typing import Any
+from typing import Any, Callable, Dict, Optional
 
 from ddgs import DDGS
 from pulp import (
@@ -36,6 +34,14 @@ from pulp import (
 
 from config import get_settings
 from logging_setup import get_logger
+from nutrition_formulas import (
+    bmi,
+    bmr_mifflin_st_jeor,
+    daily_calorie_target,
+    full_assessment,
+    macro_split,
+    tdee,
+)
 from utils import save_to_json, should_debug
 
 _qf_logger = get_logger("tools.quantities_finder")
@@ -190,47 +196,255 @@ class QuantitiesFinder:
 
 
 # ---------------------------------------------------------------------------
-# ComputationTool (LLM-generated Python; ⚠ replace in Phase 4)
+# ComputationTool (Phase 4: deterministic + sandboxed; no subprocess/eval/exec)
 # ---------------------------------------------------------------------------
+_OP_MAP: Dict[str, Callable[[str], str]]
+
+
 class ComputationTool:
-    def __init__(self, llm_instance):
+    """Deterministic numerical helpers for the agent system.
+
+    Accepts either:
+
+    1. A structured JSON task: ``{"op": "<name>", ...args}``. Supported ops:
+       ``bmi``, ``bmr``, ``tdee``, ``calorie_target``, ``macro_split``,
+       ``full_assessment``, ``eval`` (sandboxed math expression).
+    2. A free-form English task (legacy). The tool's regex parser tries to
+       extract numeric arguments and dispatch to the right formula. If
+       parsing is ambiguous, the tool returns a structured error asking the
+       agent to retry with the JSON form — no LLM-generated code, no
+       subprocess.
+    """
+
+    # Activity / sex / goal lexicon used by the free-form parser.
+    _SEX_PATTERN = re.compile(r"\b(male|female)\b", re.I)
+    _ACTIVITY_PATTERN = re.compile(
+        r"\b(sedentary|lightly active|moderately active|very active|extra active)\b",
+        re.I,
+    )
+    _GOAL_PATTERN = re.compile(
+        r"\b(lose weight|maintain weight|gain muscle|gain weight)\b", re.I
+    )
+
+    def __init__(self, llm_instance: Optional[Any] = None) -> None:
+        # llm_instance retained only for backwards-compat constructor signature;
+        # this tool no longer calls the LLM.
         self.llm = llm_instance
 
+    # ------------------------------------------------------------------
     def handle_task(self, task_description: str) -> str:
-        _comp_logger.info("\n🤖 COMPUTATION TOOL STARTED")
-        settings = get_settings()
-        instruction = (
-            "You are a Python coding assistant. Generate only the Python code required "
-            "to perform the given task. Do not forget to print the result. Do not add explanations."
-        )
-        prompt = f"{instruction}\n\nTask: {task_description}\n\nCode:"
+        _comp_logger.info("\n🤖 COMPUTATION TOOL STARTED (deterministic)")
+        try:
+            result = self._dispatch(task_description)
+        except Exception as e:  # noqa: BLE001
+            result = {"error": f"{type(e).__name__}: {e}"}
 
-        if should_debug("tools", "ComputationTool") and settings.debug_level == "full":
-            _comp_logger.debug("Computation Tool Prompt:\n%s", prompt)
-        code_response = self.llm(prompt)[0]
-        if should_debug("tools", "ComputationTool"):
-            _comp_logger.debug("Computation Tool Response:\n%s", code_response)
-
-        match = re.search(r"```python\n(.*?)\n```", code_response, re.DOTALL)
-        if not match:
-            match = re.search(r"```\n(.*?)\n```", code_response, re.DOTALL)
-        code_to_execute = match.group(1).strip() if match else code_response.strip()
-
-        execution_result = execute_python_code_raw(code_to_execute)
-
+        result_json = json.dumps(result)
         save_to_json(
             {
-                "instruction": instruction,
                 "input": task_description,
-                "output": code_to_execute,
-                "execution_result": execution_result,
+                "result": result,
                 "timestamp": datetime.now().isoformat(),
             },
             f"computation_tool_{datetime.now().isoformat()}.json",
             subdirectory="ComputationTool",
         )
-        _comp_logger.info("🤖 COMPUTATION COMPLETED\n%s", execution_result)
-        return execution_result
+        _comp_logger.info("🤖 COMPUTATION COMPLETED %s", result_json)
+        return result_json
+
+    # ------------------------------------------------------------------
+    def _dispatch(self, task: str) -> Dict[str, Any]:
+        # 1. Structured JSON dispatch
+        try:
+            data = json.loads(task)
+            if isinstance(data, dict) and "op" in data:
+                return self._run_op(data)
+        except (json.JSONDecodeError, TypeError):
+            pass
+
+        # 2. Free-form English -> formula
+        return self._parse_free_form(task)
+
+    def _run_op(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        op_name = str(data.get("op", "")).lower()
+        if op_name == "bmi":
+            return {"BMI": round(bmi(float(data["weight_kg"]), float(data["height_cm"])), 2)}
+        if op_name == "bmr":
+            return {
+                "BMR": round(
+                    bmr_mifflin_st_jeor(
+                        float(data["weight_kg"]),
+                        float(data["height_cm"]),
+                        float(data["age_years"]),
+                        str(data["sex"]),
+                    ),
+                    1,
+                )
+            }
+        if op_name == "tdee":
+            return {"TDEE": round(tdee(float(data["bmr"]), str(data["activity_level"])), 1)}
+        if op_name == "calorie_target":
+            return {
+                "daily_target_calories": daily_calorie_target(
+                    float(data["tdee"]), str(data["goal"])
+                )
+            }
+        if op_name == "macro_split":
+            return {
+                "macro_targets": macro_split(
+                    int(data["daily_target_calories"]),
+                    str(data["goal"]),
+                    weight_kg=float(data["weight_kg"]) if "weight_kg" in data else None,
+                )
+            }
+        if op_name == "full_assessment":
+            return full_assessment(
+                weight_kg=float(data["weight_kg"]),
+                height_cm=float(data["height_cm"]),
+                age_years=float(data["age_years"]),
+                sex=str(data["sex"]),
+                activity_level=str(data["activity_level"]),
+                goal=str(data["goal"]),
+            )
+        if op_name == "eval":
+            return {"result": safe_math_eval(str(data["expression"]))}
+        raise ValueError(
+            f"Unknown op {op_name!r}. Valid: bmi, bmr, tdee, calorie_target, "
+            "macro_split, full_assessment, eval."
+        )
+
+    # ------------------------------------------------------------------
+    def _parse_free_form(self, task: str) -> Dict[str, Any]:
+        """Extract numeric kwargs from a free-form sentence and dispatch."""
+        t = task.lower()
+        nums = _extract_numbers(task)
+
+        sex_m = self._SEX_PATTERN.search(task)
+        activity_m = self._ACTIVITY_PATTERN.search(task)
+        goal_m = self._GOAL_PATTERN.search(task)
+
+        sex = sex_m.group(1).lower() if sex_m else None
+        activity = activity_m.group(1).lower() if activity_m else None
+        goal = goal_m.group(1).lower() if goal_m else None
+
+        # Heuristic intent detection.
+        wants_full = any(
+            k in t for k in ("bmi", "bmr", "tdee", "calorie", "macro", "assessment")
+        ) and {"weight_kg", "height_cm", "age"}.issubset(_label_numbers(task, nums).keys())
+
+        labelled = _label_numbers(task, nums)
+
+        if wants_full and sex and activity and goal:
+            return full_assessment(
+                weight_kg=labelled["weight_kg"],
+                height_cm=labelled["height_cm"],
+                age_years=labelled["age"],
+                sex=sex,
+                activity_level=activity,
+                goal=goal,
+            )
+
+        if "bmi" in t and "weight_kg" in labelled and "height_cm" in labelled:
+            return {"BMI": round(bmi(labelled["weight_kg"], labelled["height_cm"]), 2)}
+
+        # Pure arithmetic fallback ("compute 2700 * 0.30 / 4")
+        candidate = _strip_to_expression(task)
+        if candidate and re.fullmatch(r"[\d\.\s\+\-\*\/\(\)]+", candidate):
+            return {"result": safe_math_eval(candidate)}
+
+        return {
+            "error": (
+                "ComputationTool could not parse the task. Re-issue using JSON: "
+                '{"op": "full_assessment", "weight_kg": ..., "height_cm": ..., '
+                '"age_years": ..., "sex": "male"|"female", '
+                '"activity_level": "sedentary"|..., "goal": "lose weight"|...}'
+            ),
+            "received": task,
+        }
+
+
+# ---------------------------------------------------------------------------
+# Safe math evaluator (no names, no calls, no attribute access)
+# ---------------------------------------------------------------------------
+_SAFE_BIN_OPS = {
+    ast.Add: op.add,
+    ast.Sub: op.sub,
+    ast.Mult: op.mul,
+    ast.Div: op.truediv,
+    ast.FloorDiv: op.floordiv,
+    ast.Mod: op.mod,
+    ast.Pow: op.pow,
+}
+_SAFE_UNARY_OPS = {ast.UAdd: op.pos, ast.USub: op.neg}
+
+
+def safe_math_eval(expression: str) -> float:
+    """Evaluate ``expression`` using a strict AST whitelist.
+
+    Allowed: numeric literals, the seven arithmetic binary operators above,
+    unary +/-, and parentheses. Anything else (names, calls, attribute access,
+    subscripts, comprehensions, comparisons, lambdas, ...) raises ``ValueError``.
+    """
+    if len(expression) > 200:
+        raise ValueError("expression too long")
+    tree = ast.parse(expression, mode="eval")
+
+    def _eval(node: ast.AST) -> float:
+        if isinstance(node, ast.Expression):
+            return _eval(node.body)
+        if isinstance(node, ast.Constant):
+            if isinstance(node.value, (int, float)):
+                return float(node.value)
+            raise ValueError(f"Forbidden constant: {node.value!r}")
+        if isinstance(node, ast.BinOp) and type(node.op) in _SAFE_BIN_OPS:
+            return _SAFE_BIN_OPS[type(node.op)](_eval(node.left), _eval(node.right))
+        if isinstance(node, ast.UnaryOp) and type(node.op) in _SAFE_UNARY_OPS:
+            return _SAFE_UNARY_OPS[type(node.op)](_eval(node.operand))
+        raise ValueError(f"Forbidden expression node: {type(node).__name__}")
+
+    return float(_eval(tree))
+
+
+# ---------------------------------------------------------------------------
+# Free-form parser helpers
+# ---------------------------------------------------------------------------
+_NUMBER_RE = re.compile(r"-?\d+(?:\.\d+)?")
+
+
+def _extract_numbers(text: str) -> list[float]:
+    return [float(m) for m in _NUMBER_RE.findall(text)]
+
+
+def _label_numbers(text: str, nums: list[float]) -> Dict[str, float]:
+    """Best-effort: associate numbers with role labels by scanning units around them."""
+    labelled: Dict[str, float] = {}
+    for m in _NUMBER_RE.finditer(text):
+        n = float(m.group(0))
+        # Look at the next 12 chars after the number for a unit hint.
+        tail = text[m.end() : m.end() + 12].lower()
+        head = text[max(0, m.start() - 25) : m.start()].lower()
+        if "kg" in tail and "weight_kg" not in labelled:
+            labelled["weight_kg"] = n
+        elif "cm" in tail and "height_cm" not in labelled:
+            labelled["height_cm"] = n
+        elif (
+            "year" in tail
+            or "years" in tail
+            or "yo" in tail
+            or "y/o" in tail
+            or "age" in head
+        ) and "age" not in labelled:
+            labelled["age"] = n
+    return labelled
+
+
+def _strip_to_expression(text: str) -> str | None:
+    """Pull out an obvious arithmetic substring like '2700 * 0.30 / 4'."""
+    m = re.search(r"[\d\.\(\)\+\-\*\/\s]{4,}", text)
+    if not m:
+        return None
+    candidate = m.group(0).strip()
+    return candidate if any(c in candidate for c in "+-*/") else None
 
 
 # ---------------------------------------------------------------------------
@@ -326,30 +540,9 @@ class WebSearchTool:
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-def execute_python_code_raw(code_string: str) -> str:
-    """⚠ Phase 4 will replace this with a sandbox or deterministic functions."""
-    settings = get_settings()
-    if should_debug("tools", "ComputationTool") and settings.debug_level == "full":
-        _comp_logger.debug("🐍 Executing Code (raw):\n%s", code_string)
-    script_path = ""
-    try:
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False) as tmp_script:
-            tmp_script.write(code_string)
-            script_path = tmp_script.name
-        process = subprocess.run(
-            ["python", script_path],
-            capture_output=True,
-            text=True,
-            timeout=30,
-        )
-        if process.returncode == 0:
-            return f"Output:\n{process.stdout if process.stdout else 'Code executed successfully.'}"
-        return f"Error:\n{process.stderr}"
-    except Exception as e:  # noqa: BLE001
-        return f"Execution Exception: {str(e)}"
-    finally:
-        if script_path and os.path.exists(script_path):
-            os.remove(script_path)
+# Note: ``execute_python_code_raw`` (subprocess-based) was REMOVED in Phase 4.
+# It executed LLM-generated Python on the host with no sandbox — a remote
+# code execution vector. Replaced by deterministic formulas + safe_math_eval.
 
 
 def search_web_raw(query: str, num_results: int = 3) -> str:
