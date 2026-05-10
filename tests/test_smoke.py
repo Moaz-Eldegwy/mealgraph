@@ -40,11 +40,18 @@ def test_initialize_empty_memory_shape() -> None:
 
 
 def test_default_model_configs_present() -> None:
-    """The five-LLM topology (main / agents / tools / planner / simulator)
-    is a contract the rest of the system depends on."""
+    """Model topology is a contract the rest of the system depends on.
+    Phase 2 adds 'validation_agent' (Gemini Flash; cheap critic loop)."""
     from nutritionmas import DEFAULT_MODEL_CONFIGS
 
-    expected = {"main", "agents_llm", "tools_llm", "planner_agent", "user_simulator"}
+    expected = {
+        "main",
+        "agents_llm",
+        "tools_llm",
+        "planner_agent",
+        "validation_agent",
+        "user_simulator",
+    }
     assert set(DEFAULT_MODEL_CONFIGS.keys()) == expected
 
 

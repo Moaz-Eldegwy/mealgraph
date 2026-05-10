@@ -11,6 +11,7 @@ from logging_setup import get_logger, refresh_level
 from state import initialize_empty_memory
 from tools import ComputationTool, QuantitiesFinder, WebSearchTool
 from utils import APIPoolManager, create_llm
+from validation import ValidationAgent
 from workflow import setup_workflow as setup_workflow_workflow
 
 _logger = get_logger("nutritionmas")
@@ -76,6 +77,13 @@ DEFAULT_MODEL_CONFIGS = {
         "structured_output": True,
         "thinking_budget": 600,
         "params": {"max_tokens": 5120, "temperature": 0.3}
+    },
+    "validation_agent": {
+        "type": "gemini",
+        "model_name": "gemini-2.5-flash",
+        "structured_output": True,
+        "thinking_budget": 300,
+        "params": {"max_tokens": 3072, "temperature": 0.2}
     },
     "user_simulator": {
         "type": "gemini",
@@ -145,6 +153,7 @@ def create_llm_instances(api_keys: list[str], model_overrides: Optional[Dict[str
         "agents_llm": create_llm(model_configs["agents_llm"], manager),
         "tools_llm": create_llm(model_configs["tools_llm"], manager),
         "planner_agent": create_llm(model_configs["planner_agent"], manager),
+        "validation_agent": create_llm(model_configs["validation_agent"], manager),
         "user_simulator": create_llm(model_configs["user_simulator"], manager),
     }
 
@@ -168,10 +177,16 @@ def initialize_agents():
     MAIN_LLM = LLM_INSTANCES["main"]
     AGENTS_LLM = LLM_INSTANCES["agents_llm"]
     PLANNER_LLM = LLM_INSTANCES["planner_agent"]
+    VALIDATION_LLM = LLM_INSTANCES["validation_agent"]
     AGENTS = {
         "CoachAgent": CoachAgent(MAIN_LLM),
-        "MedicalAssessmentAgent": MedicalAssessmentAgent(AGENTS_LLM, TOOLS["ComputationTool"], TOOLS["WebSearchTool"]),
-        "PlannerAgent": PlannerAgent(PLANNER_LLM, TOOLS["ComputationTool"], TOOLS["WebSearchTool"], TOOLS["QuantitiesFinder"])
+        "MedicalAssessmentAgent": MedicalAssessmentAgent(
+            AGENTS_LLM, TOOLS["ComputationTool"], TOOLS["WebSearchTool"]
+        ),
+        "PlannerAgent": PlannerAgent(
+            PLANNER_LLM, TOOLS["ComputationTool"], TOOLS["WebSearchTool"], TOOLS["QuantitiesFinder"]
+        ),
+        "ValidationAgent": ValidationAgent(VALIDATION_LLM),
     }
 
 def setup_workflow():
