@@ -1,45 +1,52 @@
-import os
-import config
-from state import NutritionState, initialize_empty_memory
-from utils import create_llm, save_to_json, APIPoolManager
-from tools import ComputationTool, WebSearchTool, QuantitiesFinder
-from agents import CoachAgent, MedicalAssessmentAgent, PlannerAgent
-from workflow import setup_workflow as setup_workflow_workflow
-from datetime import datetime
-import random
 import json
-from typing import Optional, Dict, Any, List
-from IPython.display import display, Markdown
+import os
+from datetime import datetime
+from typing import Any, Dict, List, Optional
 
-def debug(level: str = 'full', scopes: Optional[Dict[str, List[str]]] = None):
-    """
-    Enable debug mode with specified level and scopes.
-    
+from IPython.display import Markdown, display
+
+from agents import CoachAgent, MedicalAssessmentAgent, PlannerAgent
+from config import set_settings
+from logging_setup import get_logger, refresh_level
+from state import initialize_empty_memory
+from tools import ComputationTool, QuantitiesFinder, WebSearchTool
+from utils import APIPoolManager, create_llm
+from validation import ValidationAgent
+from workflow import setup_workflow as setup_workflow_workflow
+
+_logger = get_logger("nutritionmas")
+
+
+def debug(level: str = "full", scopes: Optional[Dict[str, List[str]]] = None) -> None:
+    """Enable debug mode with the given level and scopes.
+
     Args:
         level: 'full' (default) to show inputs and outputs, or 'output' to show only outputs.
-        scopes: Optional dict like {'agents': ['all'], 'tools': ['ComputationTool']}.
+        scopes: Optional dict like ``{'agents': ['all'], 'tools': ['ComputationTool']}``.
                 If None, defaults to all agents and tools.
     """
-    config.DEBUG_MODE = True
-    config.DEBUG_LEVEL = level
     if scopes is None:
-        config.DEBUG_SCOPES = {'agents': ['all'], 'tools': ['all']}
-    else:
-        config.DEBUG_SCOPES = scopes
+        scopes = {"agents": ["all"], "tools": ["all"]}
+    set_settings(debug_mode=True, debug_level=level, debug_scopes=scopes)
+    refresh_level()
 
-def logging(log_dir=None, persistence_dir=None):
+
+def logging(log_dir: Optional[str] = None, persistence_dir: Optional[str] = None) -> None:  # noqa: A001 - public name kept for backwards compat
+    """Set directories for log files and LangGraph checkpoint persistence.
+
+    If ``log_dir`` is provided, agent/tool I/O is dumped there as JSON.
+    If ``persistence_dir`` is provided, LangGraph checkpoints are persisted to disk.
+    If neither is set, logging is disabled and persistence is in-memory.
     """
-    Set the directories for logging and persistence.
-    If log_dir is provided, logging will be enabled to that directory.
-    If persistence_dir is provided, file-based persistence will be used for checkpoints.
-    If not provided, logging is disabled, and in-memory persistence is used.
-    """
+    updates: Dict[str, Any] = {}
     if log_dir is not None:
-        config.LOG_DIR = log_dir
-        os.makedirs(config.LOG_DIR, exist_ok=True)
+        os.makedirs(log_dir, exist_ok=True)
+        updates["log_dir"] = log_dir
     if persistence_dir is not None:
-        config.PERSISTENCE_DIR = persistence_dir
-        os.makedirs(config.PERSISTENCE_DIR, exist_ok=True)
+        os.makedirs(persistence_dir, exist_ok=True)
+        updates["persistence_dir"] = persistence_dir
+    if updates:
+        set_settings(**updates)
 
 # Default model configurations (without API keys, as they will be provided by the user)
 DEFAULT_MODEL_CONFIGS = {
@@ -70,6 +77,13 @@ DEFAULT_MODEL_CONFIGS = {
         "structured_output": True,
         "thinking_budget": 600,
         "params": {"max_tokens": 5120, "temperature": 0.3}
+    },
+    "validation_agent": {
+        "type": "gemini",
+        "model_name": "gemini-2.5-flash",
+        "structured_output": True,
+        "thinking_budget": 300,
+        "params": {"max_tokens": 3072, "temperature": 0.2}
     },
     "user_simulator": {
         "type": "gemini",
@@ -115,25 +129,32 @@ def create_llm_instances(api_keys: list[str], model_overrides: Optional[Dict[str
         rate_limits = None
 
     manager = APIPoolManager(api_keys, rate_limits)
-    print(f"APIPoolManager initialized with {'rate limiting enabled' if enable_rate_limiting else 'rate limiting disabled'} and {len(api_keys)} API keys.")
+    _logger.info(
+        "APIPoolManager initialized with %s and %d API keys.",
+        "rate limiting enabled" if enable_rate_limiting else "rate limiting disabled",
+        len(api_keys),
+    )
 
-    model_configs = {}
+    # Note: previously this loop used a local variable named ``config`` which
+    # shadowed the imported ``config`` module — now ``cfg`` to avoid the trap.
+    model_configs: Dict[str, Dict[str, Any]] = {}
     for key in DEFAULT_MODEL_CONFIGS:
-        config = DEFAULT_MODEL_CONFIGS[key].copy()
+        cfg = DEFAULT_MODEL_CONFIGS[key].copy()
         if model_overrides and key in model_overrides:
             override = model_overrides[key]
             if "model_name" in override:
-                config["model_name"] = override["model_name"]
+                cfg["model_name"] = override["model_name"]
             if "params" in override:
-                config["params"].update(override["params"])
-        model_configs[key] = config
+                cfg["params"] = {**cfg.get("params", {}), **override["params"]}
+        model_configs[key] = cfg
 
     LLM_INSTANCES = {
         "main": create_llm(model_configs["main"], manager),
         "agents_llm": create_llm(model_configs["agents_llm"], manager),
         "tools_llm": create_llm(model_configs["tools_llm"], manager),
         "planner_agent": create_llm(model_configs["planner_agent"], manager),
-        "user_simulator": create_llm(model_configs["user_simulator"], manager)
+        "validation_agent": create_llm(model_configs["validation_agent"], manager),
+        "user_simulator": create_llm(model_configs["user_simulator"], manager),
     }
 
 def initialize_tools():
@@ -156,10 +177,16 @@ def initialize_agents():
     MAIN_LLM = LLM_INSTANCES["main"]
     AGENTS_LLM = LLM_INSTANCES["agents_llm"]
     PLANNER_LLM = LLM_INSTANCES["planner_agent"]
+    VALIDATION_LLM = LLM_INSTANCES["validation_agent"]
     AGENTS = {
         "CoachAgent": CoachAgent(MAIN_LLM),
-        "MedicalAssessmentAgent": MedicalAssessmentAgent(AGENTS_LLM, TOOLS["ComputationTool"], TOOLS["WebSearchTool"]),
-        "PlannerAgent": PlannerAgent(PLANNER_LLM, TOOLS["ComputationTool"], TOOLS["WebSearchTool"], TOOLS["QuantitiesFinder"])
+        "MedicalAssessmentAgent": MedicalAssessmentAgent(
+            AGENTS_LLM, TOOLS["ComputationTool"], TOOLS["WebSearchTool"]
+        ),
+        "PlannerAgent": PlannerAgent(
+            PLANNER_LLM, TOOLS["ComputationTool"], TOOLS["WebSearchTool"], TOOLS["QuantitiesFinder"]
+        ),
+        "ValidationAgent": ValidationAgent(VALIDATION_LLM),
     }
 
 def setup_workflow():
