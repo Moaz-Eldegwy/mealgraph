@@ -1,0 +1,52 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "nutrition-mas"
+version = "0.2.0"
+description = "Multi-agent system for personalised nutrition planning, built on LangGraph + Gemini."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Moaz Eldegwy", email = "moazeldegwy@gmail.com" }]
+
+dependencies = [
+    "langgraph>=0.2.50,<0.3",
+    "langchain-core>=0.3.20,<0.4",
+    "google-genai>=0.3.0",
+    "pydantic>=2.9,<3",
+    "pydantic-settings>=2.6,<3",
+    "pulp>=2.9,<3",
+    "ddgs>=6.3,<7",
+    "json-repair>=0.30",
+    "python-dotenv>=1.0,<2",
+    "ipython>=8.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.24",
+    "pytest-cov>=5.0",
+    "ruff>=0.7",
+]
+
+[tool.setuptools]
+py-modules = ["agents", "config", "nutritionmas", "state", "tools", "utils", "workflow", "logging_setup"]
+
+[tool.ruff]
+line-length = 110
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "SIM"]
+ignore = ["E501"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra --strict-markers"
+markers = [
+    "integration: tests that hit a real LLM (skipped by default)",
+    "slow: long-running tests",
+]
