@@ -20,23 +20,58 @@ from utils import APIPoolManager, LLM
 class MockLLM(LLM):
     """LLM stub that returns canned responses in order.
 
-    Tests construct it with a list of strings (or dicts, auto-JSON-serialised)
-    and each call pops the next one. Out-of-script calls raise so missing
+    Tests construct it with a list of either:
+
+    * a JSON-string (returned as-is for the untyped __call__ path),
+    * a dict (JSON-serialised on push; validated against the requested schema
+      on call_typed),
+    * a Pydantic ``BaseModel`` instance (returned as-is from call_typed; its
+      ``.model_dump_json()`` is used for __call__).
+
+    Each call pops the next item. Out-of-script calls raise so missing
     fixtures are noisy rather than silent.
     """
 
     def __init__(self, responses: List[Any]) -> None:
-        self.responses = [r if isinstance(r, str) else json.dumps(r) for r in responses]
+        self._responses: List[Any] = list(responses)
         self.calls: List[str] = []
+        self.typed_calls: List[tuple[str, type]] = []
 
-    def __call__(self, prompt: str, **_: Any) -> List[str]:
+    def _next(self, prompt: str) -> Any:
         self.calls.append(prompt)
-        if not self.responses:
+        if not self._responses:
             raise AssertionError(
                 f"MockLLM ran out of canned responses (call #{len(self.calls)}). "
                 f"Last prompt:\n{prompt[:300]}"
             )
-        return [self.responses.pop(0)]
+        return self._responses.pop(0)
+
+    def __call__(self, prompt: str, **_: Any) -> List[str]:
+        item = self._next(prompt)
+        if hasattr(item, "model_dump_json"):
+            return [item.model_dump_json()]
+        if isinstance(item, dict):
+            return [json.dumps(item)]
+        return [str(item)]
+
+    def call_typed(self, prompt: str, response_model: type, **_: Any):
+        from pydantic import BaseModel
+
+        self.typed_calls.append((prompt, response_model))
+        item = self._next(prompt)
+        if isinstance(item, BaseModel):
+            return item if isinstance(item, response_model) else None
+        if isinstance(item, dict):
+            try:
+                return response_model.model_validate(item)
+            except Exception:
+                return None
+        if isinstance(item, str):
+            try:
+                return response_model.model_validate_json(item)
+            except Exception:
+                return None
+        return None
 
     def format_prompt(self, messages: List[Dict[str, str]]) -> str:
         return "\n".join(f"{m['role']}: {m['content']}" for m in messages)

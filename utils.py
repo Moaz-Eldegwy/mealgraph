@@ -22,14 +22,16 @@ import pickle
 import re
 import time
 from collections import deque
+from dataclasses import dataclass, field
 from datetime import date, datetime
 from threading import Lock
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Type, TypeVar
 
 from google import genai
 from google.genai import types
 from json_repair import repair_json
 from langgraph.checkpoint.base import BaseCheckpointSaver
+from pydantic import BaseModel, ValidationError
 
 from config import get_settings
 from logging_setup import get_logger
@@ -37,6 +39,41 @@ from logging_setup import get_logger
 _logger = get_logger("utils")
 _llm_logger = get_logger("llm.gemini")
 _pool_logger = get_logger("utils.api_pool")
+
+T = TypeVar("T", bound=BaseModel)
+
+
+# --- Phase 1 fallback metrics --------------------------------------------------
+@dataclass
+class ParseMetrics:
+    """Counts native-vs-fallback parses across the process.
+
+    Phase 1's goal is to drive ``fallback_parses`` to zero. Phase 2 will surface
+    these via the eval harness.
+    """
+
+    native_parses: int = 0  # response.parsed worked first try
+    fallback_parses: int = 0  # had to invoke extract_and_parse_json
+    schema_failures: int = 0  # output failed Pydantic validation altogether
+    by_model: Dict[str, Dict[str, int]] = field(default_factory=dict)
+
+    def record(self, model: str, kind: str) -> None:
+        if kind == "native":
+            self.native_parses += 1
+        elif kind == "fallback":
+            self.fallback_parses += 1
+        elif kind == "failure":
+            self.schema_failures += 1
+        slot = self.by_model.setdefault(model, {"native": 0, "fallback": 0, "failure": 0})
+        slot[kind] = slot.get(kind, 0) + 1
+
+
+_parse_metrics = ParseMetrics()
+
+
+def get_parse_metrics() -> ParseMetrics:
+    """Return the global parse-metrics singleton (read-only-ish)."""
+    return _parse_metrics
 
 
 # --- Debug-scope helper --------------------------------------------------------
@@ -104,6 +141,75 @@ class GeminiLLM(LLM):
             self.thinking_budget = None
 
     def __call__(self, prompt: str, **kwargs: Any) -> list[str]:
+        """Untyped streaming call. Returns ``[response_text]``.
+
+        Backwards-compat path used by code that still parses JSON-from-text.
+        Prefer :meth:`call_typed` when a Pydantic schema is available.
+        """
+        text, _ = self._invoke(prompt, response_schema=None, **kwargs)
+        return [text]
+
+    def call_typed(
+        self,
+        prompt: str,
+        response_model: Type[T],
+        **kwargs: Any,
+    ) -> Optional[T]:
+        """Call Gemini with constrained-decoded JSON matching ``response_model``.
+
+        Returns a parsed instance of ``response_model``, or ``None`` if every
+        parse strategy failed (in which case the parse-metrics ``schema_failures``
+        counter is incremented so the eval harness can spot it).
+        """
+        text, parsed = self._invoke(prompt, response_schema=response_model, **kwargs)
+
+        # Strategy 1: SDK already parsed it for us via response_schema.
+        if isinstance(parsed, response_model):
+            _parse_metrics.record(self.model_name, "native")
+            return parsed
+
+        # Strategy 2: SDK gave us a dict; try to validate it.
+        if isinstance(parsed, dict):
+            try:
+                instance = response_model.model_validate(parsed)
+                _parse_metrics.record(self.model_name, "native")
+                return instance
+            except ValidationError as e:
+                _llm_logger.debug("response.parsed dict failed Pydantic validation: %s", e)
+
+        # Strategy 3: regex / json_repair fallback on the raw text.
+        try:
+            data = extract_and_parse_json(text)
+            instance = response_model.model_validate(data)
+            _parse_metrics.record(self.model_name, "fallback")
+            _llm_logger.warning(
+                "Used JSON-repair fallback for %s on model %s — fix the prompt or schema",
+                response_model.__name__,
+                self.model_name,
+            )
+            return instance
+        except (ValidationError, Exception) as e:  # noqa: BLE001
+            _parse_metrics.record(self.model_name, "failure")
+            _llm_logger.error(
+                "Failed to parse %s from %s response: %s",
+                response_model.__name__,
+                self.model_name,
+                str(e),
+            )
+            return None
+
+    def _invoke(
+        self,
+        prompt: str,
+        response_schema: Optional[Type[BaseModel]] = None,
+        **kwargs: Any,
+    ) -> Tuple[str, Any]:
+        """Single Gemini round-trip. Returns ``(text, response.parsed)``.
+
+        ``parsed`` is whatever the SDK populated on ``response.parsed`` —
+        usually a Pydantic instance when ``response_schema`` is supplied, ``None``
+        otherwise.
+        """
         if self.manager is None:
             raise ValueError("APIPoolManager must be provided for rate limiting.")
 
@@ -113,44 +219,62 @@ class GeminiLLM(LLM):
         try:
             client = genai.Client(api_key=api_key)
             contents = [types.Content(role="user", parts=[types.Part.from_text(text=prompt)])]
-            generate_content_config = self._build_config(merged_kwargs)
+            generate_content_config = self._build_config(merged_kwargs, response_schema=response_schema)
 
-            response_text = ""
             start_time = time.time()
-            for chunk in client.models.generate_content_stream(
-                model=self.model_name,
-                contents=contents,
-                config=generate_content_config,
-            ):
-                if chunk.text:
-                    response_text += chunk.text
+            # Non-streaming when we want response.parsed (the streaming API
+            # doesn't populate it). Streaming for free-text plain calls.
+            if response_schema is not None:
+                response = client.models.generate_content(
+                    model=self.model_name,
+                    contents=contents,
+                    config=generate_content_config,
+                )
+                response_text = response.text or ""
+                parsed = getattr(response, "parsed", None)
+            else:
+                response_text = ""
+                parsed = None
+                for chunk in client.models.generate_content_stream(
+                    model=self.model_name,
+                    contents=contents,
+                    config=generate_content_config,
+                ):
+                    if chunk.text:
+                        response_text += chunk.text
 
             completion_time = time.time()
             if self.manager.rate_limits is not None:
                 self.manager.record_usage(api_key, self.model_name, completion_time)
 
             _llm_logger.debug(
-                "LLM call completed for %s using key …%s in %.2fs",
+                "LLM call completed for %s using key …%s in %.2fs (schema=%s)",
                 self.model_name,
                 api_key[-4:],
                 completion_time - start_time,
+                response_schema.__name__ if response_schema else "none",
             )
-            return [response_text.strip()]
+            return response_text.strip(), parsed
 
-        except Exception as e:  # noqa: BLE001 — keep the wide net for now; Phase 1 narrows it
+        except Exception as e:  # noqa: BLE001 — narrow this in Phase 4 (per-error retries)
             _llm_logger.warning(
                 "LLM call failed for %s using key …%s: %s",
                 self.model_name,
                 api_key[-4:],
                 str(e),
             )
-            return [f"Error: LLM call failed - {str(e)}"]
+            return f"Error: LLM call failed - {str(e)}", None
 
-    def _build_config(self, merged_kwargs: Dict[str, Any]) -> types.GenerateContentConfig:
+    def _build_config(
+        self,
+        merged_kwargs: Dict[str, Any],
+        response_schema: Optional[Type[BaseModel]] = None,
+    ) -> types.GenerateContentConfig:
         max_tokens = merged_kwargs.get("max_tokens", 5120)
         temperature = merged_kwargs.get("temperature", 0.3)
 
         if self.is_gemma:
+            # Gemma can't do thinking_config or response_schema.
             return types.GenerateContentConfig(
                 response_mime_type="text/plain",
                 max_output_tokens=max_tokens,
@@ -158,6 +282,14 @@ class GeminiLLM(LLM):
             )
 
         thinking_cfg = types.ThinkingConfig(thinking_budget=self.thinking_budget)
+        if response_schema is not None:
+            return types.GenerateContentConfig(
+                thinking_config=thinking_cfg,
+                response_mime_type="application/json",
+                response_schema=response_schema,
+                max_output_tokens=max_tokens,
+                temperature=temperature,
+            )
         mime = "application/json" if self.structured_output else "text/plain"
         return types.GenerateContentConfig(
             thinking_config=thinking_cfg,
