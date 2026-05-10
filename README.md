@@ -8,7 +8,7 @@ sdk_version: 5.0.0
 app_file: app.py
 pinned: false
 license: mit
-short_description: A LangGraph + Gemini multi-agent system for personalized nutrition planning with a Validator critic loop.
+short_description: Multi-agent nutrition planner with LangGraph + Gemini
 ---
 
 # 🥗 Nutrition Multi-Agent System
