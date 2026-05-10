@@ -30,6 +30,10 @@ def configure_logging(*, force: bool = False) -> None:
 
     Reads ``settings.debug_mode`` to choose between INFO (user mode) and DEBUG.
     Safe to call from library code; only the first call attaches a handler.
+
+    Reconfigures ``sys.stdout`` to UTF-8 when possible (Windows defaults to
+    cp1252 which chokes on the emoji in agent status messages). Falls back to
+    a 'replace' error handler so a stray glyph never crashes a log call.
     """
     global _CONFIGURED
     if _CONFIGURED and not force:
@@ -37,6 +41,14 @@ def configure_logging(*, force: bool = False) -> None:
 
     settings = get_settings()
     level = logging.DEBUG if settings.debug_mode else logging.INFO
+
+    # Best-effort: re-encode stdout to UTF-8 so the emoji status lines render.
+    reconf = getattr(sys.stdout, "reconfigure", None)
+    if callable(reconf):
+        try:
+            reconf(encoding="utf-8", errors="replace")
+        except Exception:  # pragma: no cover - depends on stream type
+            pass
 
     handler = logging.StreamHandler(sys.stdout)
     handler.setLevel(level)
