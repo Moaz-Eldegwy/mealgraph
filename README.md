@@ -1,4 +1,67 @@
-# Nutrition MAS Usage Guide
+---
+title: Nutrition Multi-Agent System
+emoji: 🥗
+colorFrom: green
+colorTo: blue
+sdk: gradio
+sdk_version: 5.0.0
+app_file: app.py
+pinned: false
+license: mit
+short_description: A LangGraph + Gemini multi-agent system for personalized nutrition planning with a Validator critic loop.
+---
+
+# 🥗 Nutrition Multi-Agent System
+
+A clinical-nutrition demo built on **LangGraph** + **Gemini 2.5**. A
+`CoachAgent` orchestrates `MedicalAssessmentAgent`, `PlannerAgent`,
+`ValidationAgent` (the critic loop), and `KnowledgeAgent`. The Planner
+uses a **PuLP linear-program solver** to turn LLM-drafted meals into
+exact gram quantities; the Validator deterministically catches allergy
+violations and tolerance breaches before the plan reaches the user.
+
+## Try the demo
+
+The repo doubles as a **Hugging Face Space** — paste your Gemini key into
+the sidebar of `app.py` and chat with the system live.
+
+```bash
+pip install -r requirements.txt
+python app.py
+```
+
+## Architecture at a glance
+
+| Component | Role | Key file |
+|---|---|---|
+| **CoachAgent** | Orchestrator. Decides one action per turn (call_agent / call_tool / ask_user / write_memory / compose_response). | `agents.py` |
+| **MedicalAssessmentAgent** | BMI/BMR/TDEE/macros, clinical flags, evidence sources. | `agents.py` |
+| **PlannerAgent** | Drafts meals; runs `QuantitiesFinder` LP for exact grams. | `agents.py` |
+| **ValidationAgent** | Generator-critic gate. Deterministic allergy/calorie/macro checks + LLM-graded medical-flag respect & citation requirement. | `validation.py` |
+| **KnowledgeAgent** | Citation-first lookup against authoritative domains (USDA, WHO, ADA, EFSA). | `knowledge.py` |
+| **QuantitiesFinder** | PuLP linear-program meal-quantity solver. Deterministic. | `tools.py` |
+| **ComputationTool** | Closed-form clinical formulas (Mifflin-St Jeor, ACSM activity multipliers). **No subprocess, no eval.** | `tools.py`, `nutrition_formulas.py` |
+| **WebSearchTool** | DuckDuckGo + LLM synthesis fallback. | `tools.py` |
+| **LongTermMemory** | SQLite-backed semantic / procedural / episodic tiers. | `memory.py` |
+| **Guardrails** | Prompt-injection sniff + PII redaction + HITL chip. | `guardrails.py` |
+| **MCP server** | Exposes tools to Claude Desktop / Cursor / any MCP client. | `mcp_server.py` |
+| **Agent cards** | A2A capability descriptors. | `agent_cards.py` |
+| **Observability** | LangSmith passthrough + in-process metrics. | `observability.py` |
+| **Eval harness** | 3 fixture personas, runs offline (no LLM). | `evals/` |
+
+Run the eval harness anytime:
+```bash
+python -m evals.runner
+```
+
+Run the test suite (78 tests, no Gemini calls needed):
+```bash
+pytest -ra
+```
+
+---
+
+## Library Usage
 
 This guide explains how to use the Nutrition Multi-Agent System (MAS) by importing the `nutritionmas` module and calling a few simple functions. The system handles all the complex setup internally, so you only need to provide a list of API keys and optionally override model configurations.
 

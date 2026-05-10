@@ -24,6 +24,11 @@ python-dotenv>=1.0,<2
 # Markdown rendering for notebook display (kept for backwards compat)
 ipython>=8.0
 
+# Demo UI (Hugging Face Space entry point — Phase 7).
+# Pinned to a wide range; the app.py shape supports messages-format Chatbot
+# in v4.40+ all the way through v6.x.
+gradio>=4.40,<7
+
 # Tests / dev
 pytest>=8.0
 pytest-asyncio>=0.24
