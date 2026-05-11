@@ -13,8 +13,9 @@ short_description: Multi-agent nutrition planner with LangGraph + Gemini
 
 # 🥗 Nutrition Multi-Agent System
 
-A clinical-nutrition demo built on **LangGraph** + **Gemini 2.5**. A
-`CoachAgent` orchestrates `MedicalAssessmentAgent`, `PlannerAgent`,
+A clinical-nutrition demo built on **LangGraph** + **Gemini 3.x**
+(`gemini-pro-latest` / `gemini-flash-latest` / `gemini-flash-lite-latest`).
+A `CoachAgent` orchestrates `MedicalAssessmentAgent`, `PlannerAgent`,
 `ValidationAgent` (the critic loop), and `KnowledgeAgent`. The Planner
 uses a **PuLP linear-program solver** to turn LLM-drafted meals into
 exact gram quantities; the Validator deterministically catches allergy
@@ -41,7 +42,7 @@ python app.py
 | **KnowledgeAgent** | Citation-first lookup against authoritative domains (USDA, WHO, ADA, EFSA). | `knowledge.py` |
 | **QuantitiesFinder** | PuLP linear-program meal-quantity solver. Deterministic. | `tools.py` |
 | **ComputationTool** | Closed-form clinical formulas (Mifflin-St Jeor, ACSM activity multipliers). **No subprocess, no eval.** | `tools.py`, `nutrition_formulas.py` |
-| **WebSearchTool** | DuckDuckGo + LLM synthesis fallback. | `tools.py` |
+| **WebSearchTool** | One-shot Gemini call with built-in `google_search` grounding; returns answer + cited URLs. | `tools.py` |
 | **LongTermMemory** | SQLite-backed semantic / procedural / episodic tiers. | `memory.py` |
 | **Guardrails** | Prompt-injection sniff + PII redaction + HITL chip. | `guardrails.py` |
 | **MCP server** | Exposes tools to Claude Desktop / Cursor / any MCP client. | `mcp_server.py` |
@@ -90,8 +91,8 @@ If you want to customize the `model_name` or `params` for any model, define a `m
 
 ```python
 model_overrides = {
-    "main": {"model_name": "gemini-2.5-pro", "params": {"temperature": 0.5}},
-    "agents_llm": {"model_name": "gemini-2.5-flash", "params": {"max_tokens": 6000}}
+    "main": {"model_name": "gemini-pro-latest", "params": {"temperature": 0.5}},
+    "agents_llm": {"model_name": "gemini-flash-latest", "params": {"max_tokens": 6000}}
     # Add overrides for other models as needed
 }
 ```
@@ -182,7 +183,7 @@ api_keys = [
 
 # Optional: Override model configurations
 model_overrides = {
-    "main": {"model_name": "gemini-2.5-pro", "params": {"temperature": 0.5}}
+    "main": {"model_name": "gemini-pro-latest", "params": {"temperature": 0.5}}
 }
 
 # Optional: Set logging directory
@@ -205,7 +206,7 @@ import nutritionmas
 
 api_keys = ["your_api_key1", "your_api_key2"]
 model_overrides = {
-    "main": {"model_name": "gemini-2.5-pro", "params": {"temperature": 0.5}}
+    "main": {"model_name": "gemini-pro-latest", "params": {"temperature": 0.5}}
 }
 
 nutritionmas.logging("Your Folder Path")
@@ -233,7 +234,7 @@ nutritionmas.create_llm_instances(api_keys, model_overrides, enable_rate_limitin
   Coach Agent: Composing final response
   ```
 - **Debug Mode Output**: When `debug` is called, detailed logs (inputs/outputs or outputs only) are shown for specified agents/tools, based on the `level` and `scopes`.
-- **API Key Pooling and Rate Limiting**: The system cycles through the provided API keys. When `enable_rate_limiting=True` (default), it enforces RPM (requests per minute) and RPD (requests per day) based on model-specific limits (e.g., 10 RPM / 250 RPD for gemini-2.5-flash). Keys exceeding daily limits are automatically dropped from the pool. Waits are calculated after response completion to exclude generation time. If a key is unavailable, it retries after 30 seconds.
+- **API Key Pooling and Rate Limiting**: The system cycles through the provided API keys. When `enable_rate_limiting=True` (default), it enforces RPM (requests per minute) and RPD (requests per day) based on model-specific limits (e.g., 10 RPM / 250 RPD for `gemini-flash-latest`). Keys exceeding daily limits are automatically dropped from the pool. Waits are calculated after response completion to exclude generation time. If a key is unavailable, it retries after 30 seconds.
 - **Disabling Rate Limiting**: Set `enable_rate_limiting=False` to bypass all checks and waits, useful for local testing or unlimited scenarios. The system still cycles keys for load distribution.
 - **Observed Waits in First Minute**: Small initial waits (e.g., 0.5s) may occur if there are rapid sequential calls or minor timing discrepancies during startup/system initialization. The code ensures no wait for truly first calls per key (empty timestamps), but variable generation times (~4-8s) combined with the 6s interval for flash can lead to partial waits if calls follow closely. This is by design to approximate rate limits conservatively without parallel tracking.
 - **Interactive Mode**: You’ll be prompted to enter user information (e.g., name, age, dietary preferences) and can then ask nutrition-related questions. Type `exit` to quit.

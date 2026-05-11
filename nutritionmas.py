@@ -50,57 +50,55 @@ def logging(log_dir: Optional[str] = None, persistence_dir: Optional[str] = None
     if updates:
         set_settings(**updates)
 
-# Default model configurations (without API keys, as they will be provided by the user)
+# Default model configurations (without API keys, as they will be provided by the user).
+# Targets the Gemini 3.x family via the rolling "*-latest" aliases:
+#   - gemini-pro-latest        (deep reasoning, Coach / Medical / Planner)
+#   - gemini-flash-latest      (mid-tier; reserved for overrides)
+#   - gemini-flash-lite-latest (cheapest; validator + tools + sim)
 DEFAULT_MODEL_CONFIGS = {
     "main": {
         "type": "gemini",
-        "model_name": "gemini-2.5-pro",
+        "model_name": "gemini-pro-latest",
         "structured_output": True,
         "thinking_budget": 600,
         "params": {"max_tokens": 5120, "temperature": 0.3}
     },
     "agents_llm": {
         "type": "gemini",
-        "model_name": "gemini-2.5-pro",
+        "model_name": "gemini-pro-latest",
         "structured_output": True,
         "thinking_budget": 600,
         "params": {"max_tokens": 5120, "temperature": 0.3}
     },
     "tools_llm": {
         "type": "gemini",
-        "model_name": "gemini-2.5-flash",
+        "model_name": "gemini-flash-lite-latest",
         "structured_output": False,
         "thinking_budget": 600,
         "params": {"max_tokens": 5120, "temperature": 0.3}
     },
     "planner_agent": {
         "type": "gemini",
-        "model_name": "gemini-2.5-pro",
+        "model_name": "gemini-pro-latest",
         "structured_output": True,
         "thinking_budget": 600,
         "params": {"max_tokens": 5120, "temperature": 0.3}
     },
     "validation_agent": {
         "type": "gemini",
-        "model_name": "gemini-2.5-flash",
+        "model_name": "gemini-flash-lite-latest",
         "structured_output": True,
         "thinking_budget": 300,
         "params": {"max_tokens": 3072, "temperature": 0.2}
     },
     "user_simulator": {
         "type": "gemini",
-        "model_name": "gemini-2.5-flash",
+        "model_name": "gemini-flash-lite-latest",
         "structured_output": False,
         "thinking_budget": 300,
         "params": {"max_tokens": 5120, "temperature": 0.5}
     }
 }
-
-    # "planner_agent": {
-    #     "type": "gemini",
-    #     "model_name": "gemma-3-27b-it",
-    #     "params": {"max_tokens": 8192, "temperature": 0.3}
-    # },
 
 
 # Global variables to hold the system components
@@ -122,10 +120,13 @@ def create_llm_instances(api_keys: list[str], model_overrides: Optional[Dict[str
         raise ValueError("At least one API key must be provided.")
 
     if enable_rate_limiting:
+        # Free-tier RPM/RPD per Gemini 3.x rolling alias. Conservative
+        # numbers — tighten or widen via the override path if you have a
+        # paid quota.
         rate_limits = {
-            "gemini-2.5-pro": (5, 100),
-            "gemini-2.5-flash": (10, 250),
-            "gemma-3-27b-it": (30, 1000),
+            "gemini-pro-latest": (5, 100),
+            "gemini-flash-latest": (10, 250),
+            "gemini-flash-lite-latest": (15, 500),
         }
     else:
         rate_limits = None

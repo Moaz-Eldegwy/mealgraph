@@ -41,6 +41,7 @@ def test_build_user_profile_round_trip() -> None:
         country="Egypt",
         conditions="hypertension",
         medications="lisinopril",
+        lab_results="HbA1c 6.1%, LDL 145 mg/dL",
     )
     # Round-trip via JSON to mirror what the hidden Textbox carries.
     serialised = json.dumps(payload)
@@ -49,6 +50,7 @@ def test_build_user_profile_round_trip() -> None:
     assert parsed["user_profile"]["name"] == "Test"
     assert parsed["user_profile"]["allergies"] == ["peanut", "shrimp"]
     assert parsed["medical_history"]["conditions"] == ["hypertension"]
+    assert parsed["medical_history"]["lab_results"] == "HbA1c 6.1%, LDL 145 mg/dL"
 
 
 def test_render_metrics_is_markdown() -> None:

@@ -9,6 +9,11 @@ Phase 4 (safety):
       and falls back to an AST-restricted math evaluator for arbitrary numeric
       expressions. **Closes the remote-code-execution vector.**
     * No subprocess, no eval, no exec, no file/network access from the tool.
+
+Phase 7+:
+    * :class:`WebSearchTool` is now a thin wrapper around Gemini's built-in
+      ``google_search`` grounding. Gemini generates queries, runs them, and
+      synthesises a cited answer in one round-trip. DuckDuckGo / DDGS removed.
 """
 
 from __future__ import annotations
@@ -18,10 +23,8 @@ import json
 import operator as op
 import re
 from datetime import datetime
-from time import sleep
 from typing import Any, Callable, Dict, Optional
 
-from ddgs import DDGS
 from pulp import (
     LpMinimize,
     LpProblem,
@@ -32,7 +35,6 @@ from pulp import (
     value,
 )
 
-from config import get_settings
 from logging_setup import get_logger
 from nutrition_formulas import (
     bmi,
@@ -42,7 +44,7 @@ from nutrition_formulas import (
     macro_split,
     tdee,
 )
-from utils import save_to_json, should_debug
+from utils import save_to_json
 
 _qf_logger = get_logger("tools.quantities_finder")
 _comp_logger = get_logger("tools.computation")
@@ -448,93 +450,106 @@ def _strip_to_expression(text: str) -> str | None:
 
 
 # ---------------------------------------------------------------------------
-# WebSearchTool (DuckDuckGo + LLM synthesis)
+# WebSearchTool (Gemini google_search grounding)
 # ---------------------------------------------------------------------------
 class WebSearchTool:
-    def __init__(self, llm_instance):
+    """Single-pass grounded web search.
+
+    Backed by Gemini's built-in ``google_search`` tool: one round-trip in
+    which Gemini decides which queries to run, searches Google for them,
+    synthesises a cited answer, and returns ``groundingMetadata``. No
+    third-party search provider, no separate query-generation or synthesis
+    pass — the model owns the whole loop.
+
+    The injected ``llm_instance`` must expose
+    :meth:`utils.GeminiLLM.call_grounded`. In tests, the ``MockLLM`` fixture
+    provides the same surface.
+    """
+
+    _SYSTEM_INSTRUCTION = (
+        "You are a nutrition / clinical research assistant. Answer the "
+        "question below using up-to-date sources you can find via Google "
+        "Search. Prefer authoritative domains (WHO, USDA / FDC, EFSA, NICE, "
+        "ADA, NIH, peer-reviewed journals, government health agencies). "
+        "Return a concise, factual answer; cite source URLs inline. "
+        "If the question asks for nutrition facts, give per-100g values for "
+        "calories, protein, fat, and carbohydrates when available."
+    )
+
+    def __init__(self, llm_instance: Any) -> None:
         self.llm = llm_instance
 
     def handle_task(self, research_task: str) -> str:
         _web_logger.info("\n🌐 WEB SEARCH TOOL STARTED")
-        settings = get_settings()
 
-        try:
-            task_data = json.loads(research_task)
-            if (
-                isinstance(task_data, dict)
-                and "queries" in task_data
-                and isinstance(task_data["queries"], list)
-            ):
-                _web_logger.info("JSON query list detected. Converting to single text task.")
-                research_question = " ".join(task_data["queries"])
-            else:
-                _web_logger.info("Single question mode (non-query JSON). Generating queries.")
-                research_question = research_task
-        except (json.JSONDecodeError, TypeError):
-            _web_logger.info("Single question mode (plain text). Generating queries.")
-            research_question = research_task
+        question = self._extract_question(research_task)
+        prompt = f"{self._SYSTEM_INSTRUCTION}\n\nQuestion: {question}\n\nAnswer:"
 
-        query_instruction = (
-            "Formulate concise search queries for DuckDuckGo based on the given question. "
-            "Output only the queries, one per line."
-        )
-        query_prompt = f"{query_instruction}\n\nQuestion: {research_question}\n\nQueries:"
+        if not hasattr(self.llm, "call_grounded"):
+            msg = (
+                "WebSearchTool requires a GeminiLLM with call_grounded(); "
+                f"got {type(self.llm).__name__}."
+            )
+            _web_logger.error(msg)
+            return msg
 
-        if should_debug("tools", "WebSearchTool") and settings.debug_level == "full":
-            _web_logger.debug("Web Search Query Prompt:\n%s", query_prompt)
-        search_queries_text = self.llm(query_prompt)[0]
-        if should_debug("tools", "WebSearchTool"):
-            _web_logger.debug("Web Search Query Response:\n%s", search_queries_text)
+        text, citations, queries = self.llm.call_grounded(prompt)
 
-        search_queries = [q.strip() for q in search_queries_text.split("\n") if q.strip()] or [
-            research_question
-        ]
-        if should_debug("tools", "WebSearchTool"):
-            _web_logger.debug("Parsed queries: %s", search_queries)
-
-        all_raw_results = []
-        for query in search_queries:
-            raw_results = search_web_raw(query, num_results=10)
-            _web_logger.info("Search results: %s...", raw_results[:200])
-            all_raw_results.append(f"Results for '{query}':\n{raw_results}")
-            sleep(1)
-
-        raw_search_output = "\n\n".join(all_raw_results)
-        synthesis_instruction = (
-            f"Synthesize a concise answer to:\n"
-            f"Question: {research_question}\n"
-            f"Based on:\n---\n{raw_search_output}\n---\n"
-        )
-
-        if should_debug("tools", "WebSearchTool") and settings.debug_level == "full":
-            _web_logger.debug("Web Search Synthesis Instruction:\n%s", synthesis_instruction)
-        synthesized_answer = self.llm(synthesis_instruction)[0]
-        if should_debug("tools", "WebSearchTool"):
-            _web_logger.debug("Web Search Synthesis Response:\n%s", synthesized_answer)
-
+        answer = self._append_sources(text, citations)
         timestamp = datetime.now().isoformat()
         save_to_json(
             {
-                "instruction": query_instruction,
-                "input": research_question,
-                "output": search_queries_text,
+                "input": research_task,
+                "question": question,
+                "queries_run": queries,
+                "answer": answer,
+                "citations": citations,
                 "timestamp": timestamp,
             },
-            f"web_search_tool_queries_{timestamp}.json",
+            f"web_search_tool_{timestamp}.json",
             subdirectory="WebSearchTool",
         )
-        save_to_json(
-            {
-                "instruction": synthesis_instruction,
-                "input": raw_search_output,
-                "output": synthesized_answer,
-                "timestamp": timestamp,
-            },
-            f"web_search_tool_synthesis_{timestamp}.json",
-            subdirectory="WebSearchTool",
+        _web_logger.info(
+            "🌐 WEB SEARCH TOOL completed (%d citations, queries=%s)",
+            len(citations),
+            queries,
         )
-        _web_logger.info("\n🌐 WEB SEARCH TOOL Result:\n%s\n", synthesized_answer)
-        return synthesized_answer
+        return answer
+
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _extract_question(task: str) -> str:
+        """Accept legacy ``{"queries": [...]}`` JSON or a free-form string."""
+        try:
+            data = json.loads(task)
+        except (json.JSONDecodeError, TypeError):
+            return task
+        if isinstance(data, dict):
+            if isinstance(data.get("queries"), list) and data["queries"]:
+                return " | ".join(str(q) for q in data["queries"])
+            if isinstance(data.get("query"), str):
+                return data["query"]
+            if isinstance(data.get("question"), str):
+                return data["question"]
+        return task
+
+    @staticmethod
+    def _append_sources(text: str, citations: list[Dict[str, str]]) -> str:
+        if not citations:
+            return text
+        # Skip duplicates while preserving order.
+        seen: set[str] = set()
+        lines: list[str] = []
+        for c in citations:
+            uri = c.get("uri", "")
+            if not uri or uri in seen:
+                continue
+            seen.add(uri)
+            title = c.get("title") or uri
+            lines.append(f"- [{title}]({uri})")
+        if not lines:
+            return text
+        return f"{text}\n\nSources:\n" + "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
@@ -543,24 +558,5 @@ class WebSearchTool:
 # Note: ``execute_python_code_raw`` (subprocess-based) was REMOVED in Phase 4.
 # It executed LLM-generated Python on the host with no sandbox — a remote
 # code execution vector. Replaced by deterministic formulas + safe_math_eval.
-
-
-def search_web_raw(query: str, num_results: int = 3) -> str:
-    _web_logger.info("🌐 Searching Web (raw) for: %s", query)
-    max_retries = 3
-    for attempt in range(max_retries):
-        try:
-            with DDGS() as ddgs:
-                results = list(ddgs.text(query, max_results=num_results, timelimit="m"))
-            if not results:
-                return "No search results found."
-            return "\n".join(
-                f"Title: {r.get('title')}\nURL: {r.get('href')}\nSnippet: {r.get('body')}"
-                for r in results
-            )
-        except Exception as e:  # noqa: BLE001
-            if attempt < max_retries - 1:
-                sleep(1)
-                continue
-            return f"Search Exception after {max_retries} attempts: {str(e)}"
-    return "Search Exception: exhausted retries"
+# ``search_web_raw`` (DDGS) was REMOVED in Phase 7+. Replaced by Gemini's
+# built-in ``google_search`` grounding via GeminiLLM.call_grounded().

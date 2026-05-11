@@ -198,6 +198,85 @@ class GeminiLLM(LLM):
             )
             return None
 
+    def call_grounded(
+        self,
+        prompt: str,
+        **kwargs: Any,
+    ) -> Tuple[str, List[Dict[str, str]], List[str]]:
+        """Single grounded call using Gemini's built-in ``google_search`` tool.
+
+        Gemini handles the whole search loop internally: it generates queries,
+        runs them against Google Search, synthesises an answer, and returns
+        ``groundingMetadata`` with the sources it relied on.
+
+        Returns ``(text, citations, queries)`` where ``citations`` is a list
+        of ``{"title": str, "uri": str}`` derived from
+        ``grounding_chunks`` and ``queries`` is the actual list of search
+        strings Gemini ran (useful for debugging).
+        """
+        if self.manager is None:
+            raise ValueError("APIPoolManager must be provided for rate limiting.")
+        if self.is_gemma:
+            raise ValueError("Gemma models do not support google_search grounding.")
+
+        merged_kwargs = {**self.kwargs, **kwargs}
+        api_key = self.manager.get_next_key(self.model_name)
+
+        try:
+            client = genai.Client(api_key=api_key)
+            contents = [types.Content(role="user", parts=[types.Part.from_text(text=prompt)])]
+            generate_content_config = types.GenerateContentConfig(
+                tools=[types.Tool(google_search=types.GoogleSearch())],
+                max_output_tokens=merged_kwargs.get("max_tokens", 5120),
+                temperature=merged_kwargs.get("temperature", 0.3),
+            )
+
+            start_time = time.time()
+            response = client.models.generate_content(
+                model=self.model_name,
+                contents=contents,
+                config=generate_content_config,
+            )
+            completion_time = time.time()
+            if self.manager.rate_limits is not None:
+                self.manager.record_usage(api_key, self.model_name, completion_time)
+
+            text = (response.text or "").strip()
+            citations: List[Dict[str, str]] = []
+            queries: List[str] = []
+            try:
+                candidate = response.candidates[0]
+                gm = getattr(candidate, "grounding_metadata", None)
+                if gm is not None:
+                    for chunk in getattr(gm, "grounding_chunks", None) or []:
+                        web = getattr(chunk, "web", None)
+                        if web and getattr(web, "uri", None):
+                            citations.append(
+                                {"title": web.title or web.uri, "uri": web.uri}
+                            )
+                    queries = list(getattr(gm, "web_search_queries", None) or [])
+            except (AttributeError, IndexError):
+                pass
+
+            _llm_logger.debug(
+                "Grounded LLM call completed for %s using key …%s in %.2fs (%d citations, %d queries)",
+                self.model_name,
+                api_key[-4:],
+                completion_time - start_time,
+                len(citations),
+                len(queries),
+            )
+            return text, citations, queries
+
+        except Exception as e:  # noqa: BLE001
+            _llm_logger.warning(
+                "Grounded LLM call failed for %s using key …%s: %s",
+                self.model_name,
+                api_key[-4:],
+                str(e),
+            )
+            return f"Error: grounded LLM call failed - {str(e)}", [], []
+
     def _invoke(
         self,
         prompt: str,

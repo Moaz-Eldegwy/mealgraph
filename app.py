@@ -138,6 +138,7 @@ def build_user_profile(
     country: str,
     conditions: str,
     medications: str,
+    lab_results: str,
 ) -> Dict[str, Any]:
     return {
         "user_profile": {
@@ -157,7 +158,7 @@ def build_user_profile(
             "conditions": [c.strip() for c in conditions.split(",") if c.strip()],
             "medications": [m.strip() for m in medications.split(",") if m.strip()],
             "past_issues": [],
-            "lab_results": "",
+            "lab_results": lab_results.strip(),
         },
     }
 
@@ -286,20 +287,25 @@ def build_demo() -> gr.Blocks:
                     placeholder="AIza...\nAIza...",
                     lines=3,
                 )
+                _GEMINI_MODELS = [
+                    "gemini-pro-latest",
+                    "gemini-flash-latest",
+                    "gemini-flash-lite-latest",
+                ]
                 coach_model = gr.Dropdown(
                     label="Coach model",
-                    choices=["gemini-2.5-pro", "gemini-2.5-flash"],
-                    value="gemini-2.5-pro",
+                    choices=_GEMINI_MODELS,
+                    value="gemini-pro-latest",
                 )
                 workers_model = gr.Dropdown(
                     label="Workers (Medical / Planner) model",
-                    choices=["gemini-2.5-pro", "gemini-2.5-flash"],
-                    value="gemini-2.5-pro",
+                    choices=_GEMINI_MODELS,
+                    value="gemini-pro-latest",
                 )
                 tools_model = gr.Dropdown(
                     label="Validator / Tools model",
-                    choices=["gemini-2.5-flash", "gemini-2.5-pro"],
-                    value="gemini-2.5-flash",
+                    choices=_GEMINI_MODELS,
+                    value="gemini-flash-lite-latest",
                 )
                 rate_limit = gr.Checkbox(label="Rate-limit Gemini calls", value=True)
                 debug_on = gr.Checkbox(label="Debug logging", value=False)
@@ -333,21 +339,29 @@ def build_demo() -> gr.Blocks:
                 p_country = gr.Textbox(label="Country", value="USA")
                 p_conditions = gr.Textbox(label="Medical conditions", value="")
                 p_medications = gr.Textbox(label="Medications", value="")
+                p_lab_results = gr.Textbox(
+                    label="Lab results",
+                    placeholder=(
+                        "e.g. Fasting glucose 110 mg/dL, HbA1c 6.1%, LDL 145 mg/dL, "
+                        "TSH 2.3 µIU/mL — paste a recent panel or summary."
+                    ),
+                    value="",
+                    lines=4,
+                )
                 profile_json = gr.Textbox(visible=False)
 
                 def _refresh_profile(*args: Any) -> str:
                     return json.dumps(build_user_profile(*args))
 
-                for component in [
+                _profile_inputs = [
                     p_name, p_age, p_sex, p_height, p_weight, p_activity, p_goal,
                     p_allergies, p_dislikes, p_country, p_conditions, p_medications,
-                ]:
+                    p_lab_results,
+                ]
+                for component in _profile_inputs:
                     component.change(
                         _refresh_profile,
-                        inputs=[
-                            p_name, p_age, p_sex, p_height, p_weight, p_activity, p_goal,
-                            p_allergies, p_dislikes, p_country, p_conditions, p_medications,
-                        ],
+                        inputs=_profile_inputs,
                         outputs=profile_json,
                     )
 

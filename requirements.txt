@@ -12,10 +12,8 @@ pydantic-settings>=2.6,<3
 # Optimization (meal-quantities solver)
 pulp>=2.9,<3
 
-# Web search fallback
-# No upper bound: PyPI for Python 3.13 only publishes ddgs 9.x; the
-# DDGS().text() API used in tools.py is unchanged across 6.x→9.x.
-ddgs>=6.3
+# Web search is now Gemini's built-in google_search grounding (see
+# GeminiLLM.call_grounded + WebSearchTool); no third-party search client.
 
 # JSON repair fallback (kept until Phase 1 makes it a measured fallback)
 json-repair>=0.30
