@@ -13,7 +13,9 @@ pydantic-settings>=2.6,<3
 pulp>=2.9,<3
 
 # Web search fallback
-ddgs>=6.3,<7
+# No upper bound: PyPI for Python 3.13 only publishes ddgs 9.x; the
+# DDGS().text() API used in tools.py is unchanged across 6.x→9.x.
+ddgs>=6.3
 
 # JSON repair fallback (kept until Phase 1 makes it a measured fallback)
 json-repair>=0.30
