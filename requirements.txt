@@ -29,10 +29,10 @@ ipython>=8.0
 # Demo UI (Hugging Face Space entry point — Phase 7).
 # Pinned to a wide range; the app.py shape supports messages-format Chatbot
 # in v4.40+ all the way through v6.x.
+# On HF Space, the actual gradio version is forced by README's
+# `sdk_version` front-matter (kept ≥5.50 so transitive constraints
+# resolve cleanly on Python 3.13).
 gradio>=4.40,<7
 
-# Tests / dev
-pytest>=8.0
-pytest-asyncio>=0.24
-pytest-cov>=5.0
-ruff>=0.7
+# Dev/test dependencies live in pyproject.toml's [project.optional-dependencies]
+# `dev` extra — not installed on HF Space to keep the resolver simple.
