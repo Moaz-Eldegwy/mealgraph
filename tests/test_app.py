@@ -86,9 +86,9 @@ def test_chat_handles_uninitialised_system() -> None:
     pytest.importorskip("gradio")
     from app import SessionState, chat
 
-    # Make sure nutritionmas.APP is None so we hit the guard.
-    import nutritionmas
-    nutritionmas.APP = None
+    # Make sure mealgraph.APP is None so we hit the guard.
+    import mealgraph
+    mealgraph.APP = None
 
     history, log, metrics, session = chat(
         user_message="hi", history=[], session=SessionState(), profile_json=""

@@ -1,17 +1,14 @@
 ---
 title: Nutrition Multi-Agent System
 emoji: 🥗
-colorFrom: green
-colorTo: blue
 sdk: gradio
 sdk_version: 5.50.0
 app_file: app.py
-pinned: false
-license: mit
+license: cc-by-nc-4.0
 short_description: Multi-agent nutrition planner with LangGraph + Gemini
 ---
 
-# 🥗 Nutrition Multi-Agent System
+# 🥗 MealGraph — Nutrition Multi-Agent System
 
 **Live demo:** <https://huggingface.co/spaces/moazeldegwy/mealgraph>
 
@@ -121,13 +118,13 @@ pytest -ra
 
 ## Library usage
 
-The same code runs as a library. Import the `nutritionmas` module,
+The same code runs as a library. Import the `mealgraph` module,
 provide API keys, and call a few setup functions.
 
 ### 1. Import
 
 ```python
-import nutritionmas
+import mealgraph
 ```
 
 ### 2. API keys
@@ -163,7 +160,7 @@ Rate limiting is on by default. Disable it for local development or when
 you have paid-tier quota:
 
 ```python
-nutritionmas.create_llm_instances(api_keys, model_overrides, enable_rate_limiting=False)
+mealgraph.create_llm_instances(api_keys, model_overrides, enable_rate_limiting=False)
 ```
 
 ### 5. (Optional) Debug mode
@@ -179,7 +176,7 @@ Coach Agent: Composing final response
 Debug mode adds raw LLM I/O:
 
 ```python
-nutritionmas.debug(level='full', scopes={'agents': ['CoachAgent'], 'tools': ['all']})
+mealgraph.debug(level='full', scopes={'agents': ['CoachAgent'], 'tools': ['all']})
 ```
 
 * `level`: `'full'` (inputs + outputs) or `'output'` (outputs only).
@@ -190,16 +187,16 @@ nutritionmas.debug(level='full', scopes={'agents': ['CoachAgent'], 'tools': ['al
 Dump every agent / tool I/O to a directory:
 
 ```python
-nutritionmas.logging("path/to/log/dir")
+mealgraph.logging("path/to/log/dir")
 ```
 
 ### 7. Initialise
 
 ```python
-nutritionmas.create_llm_instances(api_keys, model_overrides, enable_rate_limiting=True)
-nutritionmas.initialize_tools()
-nutritionmas.initialize_agents()
-nutritionmas.setup_workflow()
+mealgraph.create_llm_instances(api_keys, model_overrides, enable_rate_limiting=True)
+mealgraph.initialize_tools()
+mealgraph.initialize_agents()
+mealgraph.setup_workflow()
 ```
 
 ### 8. Run
@@ -208,27 +205,27 @@ Either interactive mode (collects user data via stdin) or simulation
 mode (drives one or more synthetic users through a fixed question list):
 
 ```python
-nutritionmas.run(simulate=False)
+mealgraph.run(simulate=False)
 # or
-nutritionmas.run(simulate=True, simulated_users=[...])
+mealgraph.run(simulate=True, simulated_users=[...])
 ```
 
 ### Full example
 
 ```python
-import nutritionmas
+import mealgraph
 
 api_keys = ["your_api_key1", "your_api_key2"]
 model_overrides = {
     "main": {"model_name": "gemini-pro-latest", "params": {"temperature": 0.5}},
 }
 
-nutritionmas.logging("path/to/log/dir")
-nutritionmas.create_llm_instances(api_keys, model_overrides, enable_rate_limiting=True)
-nutritionmas.initialize_tools()
-nutritionmas.initialize_agents()
-nutritionmas.setup_workflow()
-nutritionmas.run(simulate=False)
+mealgraph.logging("path/to/log/dir")
+mealgraph.create_llm_instances(api_keys, model_overrides, enable_rate_limiting=True)
+mealgraph.initialize_tools()
+mealgraph.initialize_agents()
+mealgraph.setup_workflow()
+mealgraph.run(simulate=False)
 ```
 
 ## Behaviour notes

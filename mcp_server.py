@@ -16,10 +16,10 @@ To register with Claude Desktop, add to ``~/.config/claude/desktop.json``::
 
     {
       "mcpServers": {
-        "nutrition-mas": {
+        "mealgraph": {
           "command": "python",
           "args": ["-m", "mcp_server"],
-          "cwd": "/path/to/nutrition-mas"
+          "cwd": "/path/to/mealgraph"
         }
       }
     }
@@ -44,7 +44,7 @@ def _build_server() -> Any:
     from nutrition_formulas import full_assessment as _full_assessment
     from tools import ComputationTool, QuantitiesFinder, safe_math_eval
 
-    server = FastMCP("nutrition-mas")
+    server = FastMCP("mealgraph")
     qf = QuantitiesFinder()
     comp = ComputationTool()
 

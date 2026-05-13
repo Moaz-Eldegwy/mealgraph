@@ -8,7 +8,7 @@ def test_imports_work_outside_colab() -> None:
     import agents  # noqa: F401
     import config  # noqa: F401
     import logging_setup  # noqa: F401
-    import nutritionmas  # noqa: F401
+    import mealgraph  # noqa: F401
     import state  # noqa: F401
     import tools  # noqa: F401
     import utils  # noqa: F401
@@ -39,7 +39,7 @@ def test_initialize_empty_memory_shape() -> None:
 
 def test_default_model_configs_present() -> None:
     """Model topology is a contract the rest of the system depends on."""
-    from nutritionmas import DEFAULT_MODEL_CONFIGS
+    from mealgraph import DEFAULT_MODEL_CONFIGS
 
     expected = {
         "main",
@@ -55,7 +55,7 @@ def test_default_model_configs_present() -> None:
 def test_create_llm_instances_requires_keys() -> None:
     import pytest
 
-    from nutritionmas import create_llm_instances
+    from mealgraph import create_llm_instances
 
     with pytest.raises(ValueError, match="At least one API key"):
         create_llm_instances([])

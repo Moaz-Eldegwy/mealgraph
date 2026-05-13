@@ -23,4 +23,4 @@ clean:
 	find . -type d -name __pycache__ -exec rm -rf {} +
 
 run:
-	python -c "import nutritionmas; print('Module imports OK')"
+	python -c "import mealgraph; print('Module imports OK')"

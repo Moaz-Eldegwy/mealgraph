@@ -11,7 +11,7 @@ Three pieces:
    app renders these as a live system-health panel.
 
 3. **Span context manager** — ad-hoc timing inside agents, logged through
-   the standard ``nutrition_mas`` logger so the timing line is filterable
+   the standard ``mealgraph`` logger so the timing line is filterable
    like everything else.
 """
 

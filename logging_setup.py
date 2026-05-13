@@ -1,4 +1,4 @@
-"""Centralised logging for Nutrition MAS.
+"""Centralised logging for MealGraph.
 
 Agents and tools used to ``print`` directly to stdout. That worked in a notebook
 but coupled the agentic system to the I/O layer. This module provides a single
@@ -21,12 +21,12 @@ import sys
 
 from config import get_settings
 
-_BASE = "nutrition_mas"
+_BASE = "mealgraph"
 _CONFIGURED = False
 
 
 def configure_logging(*, force: bool = False) -> None:
-    """Wire up the ``nutrition_mas`` logger tree.
+    """Wire up the ``mealgraph`` logger tree.
 
     Reads ``settings.debug_mode`` to choose between INFO (user mode) and DEBUG.
     Safe to call from library code; only the first call attaches a handler.
@@ -63,7 +63,7 @@ def configure_logging(*, force: bool = False) -> None:
 
 
 def get_logger(name: str) -> logging.Logger:
-    """Return a sub-logger under the ``nutrition_mas`` namespace.
+    """Return a sub-logger under the ``mealgraph`` namespace.
 
     Conventional names: ``agents.coach``, ``agents.medical``, ``tools.computation``,
     ``utils.api_pool``.

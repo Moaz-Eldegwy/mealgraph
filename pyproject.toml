@@ -3,7 +3,7 @@ requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "nutrition-mas"
+name = "mealgraph"
 version = "0.2.0"
 description = "Multi-agent system for personalised nutrition planning, built on LangGraph + Gemini."
 readme = "README.md"
@@ -32,7 +32,7 @@ dev = [
 ]
 
 [tool.setuptools]
-py-modules = ["agents", "config", "nutritionmas", "state", "tools", "utils", "workflow", "logging_setup"]
+py-modules = ["agents", "config", "mealgraph", "state", "tools", "utils", "workflow", "logging_setup"]
 
 [tool.ruff]
 line-length = 110

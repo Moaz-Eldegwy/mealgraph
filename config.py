@@ -1,4 +1,4 @@
-"""Nutrition MAS configuration.
+"""MealGraph configuration.
 
 This module exposes a Pydantic-Settings ``Settings`` singleton plus a small
 backward-compatibility shim so existing code can still read ``config.DEBUG_MODE``,
@@ -25,12 +25,12 @@ class Settings(BaseSettings):
     """Process-wide configuration.
 
     Values are loaded from (in order of precedence): direct ``set_settings``
-    calls, environment variables prefixed with ``NUTRITION_MAS_``, the ``.env``
+    calls, environment variables prefixed with ``MEALGRAPH_``, the ``.env``
     file in the project root, and the defaults declared here.
     """
 
     model_config = SettingsConfigDict(
-        env_prefix="NUTRITION_MAS_",
+        env_prefix="MEALGRAPH_",
         env_file=".env",
         env_file_encoding="utf-8",
         extra="ignore",

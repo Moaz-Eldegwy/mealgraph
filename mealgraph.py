@@ -16,7 +16,7 @@ from utils import APIPoolManager, create_llm
 from validation import ValidationAgent
 from workflow import setup_workflow as setup_workflow_workflow
 
-_logger = get_logger("nutritionmas")
+_logger = get_logger("mealgraph")
 
 
 def debug(level: str = "full", scopes: Optional[Dict[str, List[str]]] = None) -> None:

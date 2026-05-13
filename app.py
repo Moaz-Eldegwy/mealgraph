@@ -1,4 +1,4 @@
-"""Gradio demo app for the Nutrition MAS — entry point for the Hugging Face Space.
+"""Gradio demo app for the MealGraph — entry point for the Hugging Face Space.
 
 The app is intentionally thin: settings sidebar -> chat -> trace pane. The
 heavy lifting stays in the agent system. The whole point is to *show* the
@@ -24,7 +24,7 @@ from typing import Any, Dict, List, Tuple
 
 import gradio as gr
 
-import nutritionmas
+import mealgraph
 from agent_cards import build_default_registry
 from logging_setup import get_logger
 from observability import get_metrics, init_langsmith, span
@@ -78,12 +78,12 @@ def initialise_system(
     }
     try:
         if debug_on:
-            nutritionmas.debug(level="output")
-        nutritionmas.create_llm_instances(keys, overrides, enable_rate_limiting=rate_limit)
-        nutritionmas.initialize_tools()
-        nutritionmas.initialize_agents()
-        nutritionmas.setup_workflow()
-        nutritionmas.initialize_long_term_memory()
+            mealgraph.debug(level="output")
+        mealgraph.create_llm_instances(keys, overrides, enable_rate_limiting=rate_limit)
+        mealgraph.initialize_tools()
+        mealgraph.initialize_agents()
+        mealgraph.setup_workflow()
+        mealgraph.initialize_long_term_memory()
         init_langsmith()
         return (
             f"✅ System initialised with {len(keys)} key(s). "
@@ -97,7 +97,7 @@ def initialise_system(
 # Per-call log capture
 # ---------------------------------------------------------------------------
 class _BufferHandler(logging.Handler):
-    """Captures every nutrition_mas.* log line into a string buffer for the UI."""
+    """Captures every mealgraph.* log line into a string buffer for the UI."""
 
     def __init__(self) -> None:
         super().__init__(level=logging.INFO)
@@ -113,13 +113,13 @@ class _BufferHandler(logging.Handler):
 
 def _attach_buffer() -> _BufferHandler:
     handler = _BufferHandler()
-    root = logging.getLogger("nutrition_mas")
+    root = logging.getLogger("mealgraph")
     root.addHandler(handler)
     return handler
 
 
 def _detach_buffer(handler: _BufferHandler) -> None:
-    logging.getLogger("nutrition_mas").removeHandler(handler)
+    logging.getLogger("mealgraph").removeHandler(handler)
 
 
 # ---------------------------------------------------------------------------
@@ -182,7 +182,7 @@ def chat(
     if not history:
         history = []
     history = history + [{"role": "user", "content": user_message}]
-    if nutritionmas.APP is None:
+    if mealgraph.APP is None:
         history.append(
             {"role": "assistant", "content": "❌ System not initialised. Use the sidebar Initialize button."}
         )
@@ -216,7 +216,7 @@ def chat(
             "response_steps": [],
         }
         with span("end_to_end_chat", kind="agent"):
-            final_state = nutritionmas.APP.invoke(
+            final_state = mealgraph.APP.invoke(
                 state, config={"configurable": {"thread_id": session.thread_id}}
             )
         session.memory = final_state["memory"]
@@ -260,7 +260,7 @@ def build_demo() -> gr.Blocks:
 
     # ``theme`` moved to launch() in Gradio 6+; we still support 4/5 by passing
     # it here AND at launch() — the latter wins on newer versions.
-    with gr.Blocks(title="Nutrition MAS — Multi-Agent Demo") as demo:
+    with gr.Blocks(title="MealGraph — Multi-Agent Demo") as demo:
         gr.Markdown(
             """
             # 🥗 Nutrition Multi-Agent System
