@@ -1,4 +1,4 @@
-"""Tests for the Phase 4 safety surface: deterministic ComputationTool +
+"""Tests for the safety surface: deterministic ComputationTool +
 guardrails (prompt-injection sniff, PII redaction, HITL chip)."""
 
 from __future__ import annotations

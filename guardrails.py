@@ -1,23 +1,20 @@
 """Input/output guardrails.
 
-Phase 4 ships a minimal but useful default set:
-
 * :func:`detect_prompt_injection` — keyword/regex sniff for the common
   jailbreak patterns (ignore previous, system override, role-play override).
   Returns ``(is_attempt, matched_patterns)`` rather than auto-blocking, so
-  the caller decides the response (refuse, log, escalate, ...).
+  the caller decides the response (refuse, log, escalate, …).
 
-* :func:`redact_pii` — masks email, phone, SSN-shaped numbers, lab IDs and
-  obvious medical-record numbers in any text destined for logs / traces.
-  We keep the original strings inside the agent's working memory so the
-  *plan* can still address the user by name; only the persisted log layer
-  redacts.
+* :func:`redact_pii` — masks email, phone, SSN-shaped numbers, lab IDs,
+  and obvious medical-record numbers in any text destined for logs and
+  traces. Working memory keeps the original strings so the plan can still
+  address the user by name; only the persisted log layer redacts.
 
 * :func:`hitl_chip` — formats the human-in-the-loop escalation marker the
-  Phase 7 Gradio app renders as a coloured badge.
+  Gradio app renders as a coloured badge.
 
-These are intentionally simple — a production deployment would layer in a
-small classifier (NeMo Guardrails, Lakera, etc.) on top.
+These checks are intentionally lightweight — a production deployment
+would layer a small classifier (NeMo Guardrails, Lakera, …) on top.
 """
 
 from __future__ import annotations

@@ -1,17 +1,19 @@
-"""Utilities: LLM wrapper, API-key pool with rate limiting, JSON helpers, and a
+"""LLM wrapper, API-key pool with rate limiting, JSON helpers, and a
 LangGraph file checkpointer.
 
-Phase 0 cleanup notes:
+Contents:
 
-* Removed the duplicate ``GeminiLLM`` definition (the second class silently
-  shadowed the first; both remained import-visible).
-* Dropped ``from google.colab import userdata`` so the module imports cleanly
-  outside Colab. API keys come in via ``create_llm_instances`` or env.
-* Replaced ``print(...)`` calls with module loggers under ``nutrition_mas.*``.
-* Routed all reads of ``config.X`` through :func:`config.get_settings`.
-
-Larger refactors (Pydantic-typed agent IO, native Gemini ``response_schema``,
-async ``acall``) land in Phase 1.
+* :class:`GeminiLLM` — synchronous wrapper around ``google-genai`` with
+  Pydantic-typed structured output (:meth:`GeminiLLM.call_typed`) and a
+  grounded-search variant (:meth:`GeminiLLM.call_grounded`).
+* :func:`pydantic_to_gemini_schema` — converts a Pydantic model to a
+  ``response_schema`` dict accepted by the Gemini API.
+* :class:`APIPoolManager` — round-robin Gemini keys with optional RPM/RPD
+  enforcement.
+* :func:`extract_and_parse_json` — measured JSON-repair fallback for the
+  rare path where ``response_schema`` is unavailable.
+* :class:`FileCheckpointSaver` — pickles LangGraph checkpoints to disk so
+  long-running sessions survive a process restart.
 """
 
 from __future__ import annotations
@@ -43,13 +45,16 @@ _pool_logger = get_logger("utils.api_pool")
 T = TypeVar("T", bound=BaseModel)
 
 
-# --- Phase 1 fallback metrics --------------------------------------------------
+# --- Parse metrics -------------------------------------------------------------
 @dataclass
 class ParseMetrics:
     """Counts native-vs-fallback parses across the process.
 
-    Phase 1's goal is to drive ``fallback_parses`` to zero. Phase 2 will surface
-    these via the eval harness.
+    Native parses come from Gemini's ``response_schema``; fallback parses
+    use :func:`extract_and_parse_json` (regex / ``json_repair``). A healthy
+    deployment should see ``fallback_parses`` close to zero — anything
+    higher is a signal the prompt or schema needs work. The eval harness
+    surfaces both counters.
     """
 
     native_parses: int = 0  # response.parsed worked first try
@@ -114,11 +119,96 @@ class LLM:
         raise NotImplementedError
 
 
+# --- Gemini schema conversion -------------------------------------------------
+# Keys Gemini's response_schema either rejects or silently mishandles.
+_GEMINI_DROP_KEYS = frozenset(
+    {
+        "additionalProperties",
+        "$defs",
+        "$ref",
+        "$schema",
+        "title",
+        "default",
+        "discriminator",
+        "examples",
+        "readOnly",
+        "writeOnly",
+        "definitions",
+    }
+)
+
+
+def pydantic_to_gemini_schema(model_cls: Type[BaseModel]) -> Dict[str, Any]:
+    """Convert a Pydantic model into a Gemini-safe response_schema dict.
+
+    Pydantic's ``model_json_schema()`` emits keys (``$ref``, ``$defs``,
+    ``additionalProperties``, ``title``, ``default``) that Gemini's API does
+    not accept. This helper:
+
+    1. Inlines every ``$ref`` against ``$defs``.
+    2. Recursively strips the unsupported keys.
+    3. Promotes ``anyOf: [X, {"type": "null"}]`` (Pydantic's idiom for
+       ``Optional[X]``) into ``nullable: true`` on ``X``.
+
+    Returns a plain ``dict`` suitable for ``GenerateContentConfig.response_schema``.
+    """
+    raw = model_cls.model_json_schema()
+    defs = raw.get("$defs", {}) or raw.get("definitions", {}) or {}
+
+    def _resolve(node: Any) -> Any:
+        if isinstance(node, list):
+            return [_resolve(n) for n in node]
+        if not isinstance(node, dict):
+            return node
+
+        # Inline $ref.
+        ref = node.get("$ref")
+        if isinstance(ref, str) and ref.startswith("#/$defs/"):
+            name = ref.rsplit("/", 1)[-1]
+            target = defs.get(name)
+            if target is not None:
+                merged = {k: v for k, v in node.items() if k != "$ref"}
+                # The referenced definition wins for type/structure; extras
+                # on the wrapping node (e.g. description) are preserved.
+                return _resolve({**target, **merged})
+
+        # Collapse Optional[X] = anyOf [X, {"type": "null"}] into nullable.
+        if "anyOf" in node and isinstance(node["anyOf"], list):
+            non_null = [s for s in node["anyOf"] if s.get("type") != "null"]
+            has_null = len(non_null) != len(node["anyOf"])
+            if has_null and len(non_null) == 1:
+                base = _resolve(non_null[0])
+                merged = {k: v for k, v in node.items() if k != "anyOf"}
+                merged.update(base)
+                merged["nullable"] = True
+                return _resolve(merged)
+
+        out: Dict[str, Any] = {}
+        for k, v in node.items():
+            if k in _GEMINI_DROP_KEYS:
+                continue
+            out[k] = _resolve(v)
+        return out
+
+    sanitized = _resolve(raw)
+    # Drop any residual top-level keys that may have slipped through.
+    return {k: v for k, v in sanitized.items() if k not in _GEMINI_DROP_KEYS}
+
+
 class GeminiLLM(LLM):
     """Synchronous Gemini wrapper with API-key pooling.
 
-    Phase 1 will add an ``acall`` async path and replace the JSON-in-text
-    contract with native ``response_schema`` Pydantic models.
+    Exposes three entry points:
+
+    * :meth:`__call__` — free-text streaming call returning a single string.
+    * :meth:`call_typed` — structured-output call constrained to a Pydantic
+      model via Gemini's ``response_schema``.
+    * :meth:`call_grounded` — single round-trip with Gemini's built-in
+      ``google_search`` tool; returns text, citations, and the search
+      queries the model ran.
+
+    Every call goes through the supplied :class:`APIPoolManager` for key
+    rotation and (optional) RPM/RPD enforcement.
     """
 
     def __init__(
@@ -163,6 +253,15 @@ class GeminiLLM(LLM):
         """
         text, parsed = self._invoke(prompt, response_schema=response_model, **kwargs)
 
+        # Gemini occasionally wraps a single object in a one-element list even
+        # when the schema is object-typed. Unwrap before validation.
+        def _unwrap(value: Any) -> Any:
+            if isinstance(value, list) and len(value) == 1 and isinstance(value[0], (dict, BaseModel)):
+                return value[0]
+            return value
+
+        parsed = _unwrap(parsed)
+
         # Strategy 1: SDK already parsed it for us via response_schema.
         if isinstance(parsed, response_model):
             _parse_metrics.record(self.model_name, "native")
@@ -179,7 +278,7 @@ class GeminiLLM(LLM):
 
         # Strategy 3: regex / json_repair fallback on the raw text.
         try:
-            data = extract_and_parse_json(text)
+            data = _unwrap(extract_and_parse_json(text))
             instance = response_model.model_validate(data)
             _parse_metrics.record(self.model_name, "fallback")
             _llm_logger.warning(
@@ -335,7 +434,7 @@ class GeminiLLM(LLM):
             )
             return response_text.strip(), parsed
 
-        except Exception as e:  # noqa: BLE001 — narrow this in Phase 4 (per-error retries)
+        except Exception as e:  # noqa: BLE001 — broad on purpose; rotate key on any provider error
             _llm_logger.warning(
                 "LLM call failed for %s using key …%s: %s",
                 self.model_name,
@@ -362,10 +461,16 @@ class GeminiLLM(LLM):
 
         thinking_cfg = types.ThinkingConfig(thinking_budget=self.thinking_budget)
         if response_schema is not None:
+            # Gemini's response_schema accepts a SUBSET of OpenAPI 3.0; passing
+            # the Pydantic class direct lets the SDK emit `additionalProperties`
+            # / `$ref` / `$defs` / `title` / `default`, which the API rejects
+            # ("additionalProperties is not supported in the Gemini API").
+            # We sanitize to a dict the API actually accepts.
+            schema_dict = pydantic_to_gemini_schema(response_schema)
             return types.GenerateContentConfig(
                 thinking_config=thinking_cfg,
                 response_mime_type="application/json",
-                response_schema=response_schema,
+                response_schema=schema_dict,
                 max_output_tokens=max_tokens,
                 temperature=temperature,
             )
@@ -536,9 +641,9 @@ def create_llm(config: dict, manager: APIPoolManager) -> LLM:
 def extract_and_parse_json(text: str) -> Dict[str, Any]:
     """Best-effort JSON extraction with a chain of fallbacks.
 
-    Phase 1 makes this a measured *fallback* path only — agents will use
-    Gemini's native ``response_schema`` for guaranteed structure. Until then,
-    this remains the primary parser.
+    Reserved for the measured fallback path — :meth:`GeminiLLM.call_typed`
+    prefers Gemini's native ``response_schema`` and only falls through here
+    when the SDK returns no parsed object.
     """
     try:
         return json.loads(text.strip())

@@ -1,17 +1,18 @@
 """Observability: LangSmith passthrough + lightweight in-process metrics.
 
-Phase 6 wires three things:
+Three pieces:
 
-1. **LangSmith tracing** is opt-in via the standard ``LANGCHAIN_TRACING_V2``
-   environment variable. We only need to honour it (LangGraph picks it up
-   automatically) and surface a one-line confirmation at startup.
+1. **LangSmith tracing** — opt-in via the standard ``LANGCHAIN_TRACING_V2``
+   environment variable. LangGraph picks it up automatically; this module
+   only surfaces a one-line confirmation at startup.
 
-2. **MetricsCollector** wraps the existing ``utils.ParseMetrics`` and adds
-   per-agent latency / call count / fallback-rate counters. The Gradio app
-   in Phase 7 will render these as a live "system health" panel.
+2. **MetricsCollector** — wraps :class:`utils.ParseMetrics` and adds
+   per-agent latency, call count, and fallback-rate counters. The Gradio
+   app renders these as a live system-health panel.
 
-3. **Span context manager** for ad-hoc timing inside agents. Wraps the
-   logger so the timing line is filterable like everything else.
+3. **Span context manager** — ad-hoc timing inside agents, logged through
+   the standard ``nutrition_mas`` logger so the timing line is filterable
+   like everything else.
 """
 
 from __future__ import annotations

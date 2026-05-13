@@ -1,4 +1,4 @@
-"""Validate the Pydantic schemas that anchor every agent decision in Phase 1."""
+"""Validate the Pydantic schemas that anchor every agent decision."""
 
 from __future__ import annotations
 
@@ -128,7 +128,7 @@ def test_final_plan_minimal() -> None:
     assert plan.days[0][0].name == "oats"
 
 
-# ---- Validation (Phase 2 schemas, declared in Phase 1) ---------------------
+# ---- Validation ------------------------------------------------------------
 def test_validation_decision_default_pass() -> None:
     v = ValidationDecision(verdict="pass")
     assert v.verdict == "pass"

@@ -1,19 +1,21 @@
-"""Tools layer.
+"""Tool implementations used by the agents.
 
-Phase 1: prints -> namespaced loggers; settings via :func:`config.get_settings`.
+* :class:`QuantitiesFinder` — PuLP linear-program solver. Given a list of
+  candidate foods (with per-100g macros and an ``estimated_g`` anchor) and
+  the daily targets, it returns gram quantities that minimise the weighted
+  deviation from both the daily macro targets and the per-item anchors.
+  Optional ``meal_constraints`` express per-meal macro caps / floors.
 
-Phase 4 (safety):
-    * :class:`ComputationTool` no longer shells out to ``subprocess.run(['python', ...])``.
-      It now dispatches to closed-form clinical formulas (``nutrition_formulas``)
-      for the standard cases (BMI / BMR / TDEE / calorie target / macro split)
-      and falls back to an AST-restricted math evaluator for arbitrary numeric
-      expressions. **Closes the remote-code-execution vector.**
-    * No subprocess, no eval, no exec, no file/network access from the tool.
+* :class:`ComputationTool` — deterministic clinical formulas
+  (Mifflin-St Jeor BMR, ACSM activity multipliers, goal-driven calorie /
+  macro split). Accepts a structured ``{"op": ..., ...}`` task or a
+  free-form sentence with labelled numbers. The free-form fallback uses an
+  AST-restricted math evaluator for arbitrary numeric expressions; there is
+  no subprocess, no ``eval``, and no filesystem or network access.
 
-Phase 7+:
-    * :class:`WebSearchTool` is now a thin wrapper around Gemini's built-in
-      ``google_search`` grounding. Gemini generates queries, runs them, and
-      synthesises a cited answer in one round-trip. DuckDuckGo / DDGS removed.
+* :class:`WebSearchTool` — thin wrapper around Gemini's built-in
+  ``google_search`` grounding. Gemini generates queries, runs them, and
+  synthesises a cited answer in a single round-trip.
 """
 
 from __future__ import annotations
@@ -87,7 +89,7 @@ class QuantitiesFinder:
         return obj
 
     def handle_task(self, task: str) -> str:
-        _qf_logger.info("\n📊 ENHANCED QUANTITIES FINDER (V3) TOOL STARTED")
+        _qf_logger.info("\n📊 QUANTITIES FINDER TOOL STARTED")
         # Priority 1: hit daily totals; Priority 2: stay close to per-item estimates.
         W_NUTRITION = 1.0
         W_ESTIMATE_DEFAULT = 0.1
@@ -198,7 +200,7 @@ class QuantitiesFinder:
 
 
 # ---------------------------------------------------------------------------
-# ComputationTool (Phase 4: deterministic + sandboxed; no subprocess/eval/exec)
+# ComputationTool (deterministic + sandboxed; no subprocess/eval/exec)
 # ---------------------------------------------------------------------------
 _OP_MAP: Dict[str, Callable[[str], str]]
 
@@ -346,8 +348,54 @@ class ComputationTool:
                 goal=goal,
             )
 
-        if "bmi" in t and "weight_kg" in labelled and "height_cm" in labelled:
-            return {"BMI": round(bmi(labelled["weight_kg"], labelled["height_cm"]), 2)}
+        # Compose a partial assessment from whichever pieces we can derive.
+        # Each piece short-circuits gracefully so the caller gets back as much
+        # as the task supports — much friendlier than the all-or-nothing error.
+        partial: Dict[str, Any] = {}
+        have_anthropo = {"weight_kg", "height_cm", "age"}.issubset(labelled)
+
+        if "bmi" in t and {"weight_kg", "height_cm"}.issubset(labelled):
+            partial["BMI"] = round(bmi(labelled["weight_kg"], labelled["height_cm"]), 2)
+
+        bmr_value: float | None = None
+        if ("bmr" in t or "mifflin" in t) and have_anthropo and sex:
+            bmr_value = bmr_mifflin_st_jeor(
+                labelled["weight_kg"], labelled["height_cm"], labelled["age"], sex
+            )
+            partial["BMR"] = round(bmr_value, 1)
+
+        tdee_value: float | None = None
+        if "tdee" in t and activity:
+            base_bmr = bmr_value
+            if base_bmr is None and have_anthropo and sex:
+                base_bmr = bmr_mifflin_st_jeor(
+                    labelled["weight_kg"], labelled["height_cm"], labelled["age"], sex
+                )
+            if base_bmr is not None:
+                tdee_value = tdee(base_bmr, activity)
+                partial["TDEE"] = round(tdee_value, 1)
+
+        if ("calorie" in t or "kcal" in t or "target" in t) and goal:
+            base_tdee = tdee_value
+            if base_tdee is None and have_anthropo and sex and activity:
+                base_tdee = tdee(
+                    bmr_mifflin_st_jeor(
+                        labelled["weight_kg"], labelled["height_cm"], labelled["age"], sex
+                    ),
+                    activity,
+                )
+            if base_tdee is not None:
+                partial["daily_target_calories"] = daily_calorie_target(base_tdee, goal)
+
+        if "macro" in t and "daily_target_calories" in partial:
+            partial["macro_targets"] = macro_split(
+                partial["daily_target_calories"],
+                goal,
+                weight_kg=labelled.get("weight_kg"),
+            )
+
+        if partial:
+            return partial
 
         # Pure arithmetic fallback ("compute 2700 * 0.30 / 4")
         candidate = _strip_to_expression(task)
@@ -417,25 +465,40 @@ def _extract_numbers(text: str) -> list[float]:
     return [float(m) for m in _NUMBER_RE.findall(text)]
 
 
+_UNIT_AFTER_RE = re.compile(
+    # Require the unit to be terminated by non-word, non-slash (or EOS), so
+    # rate phrases like ``0.5kg/week`` and lab values like ``mg/dL`` no longer
+    # collapse into ``weight_kg``/``height_cm`` labels.
+    r"\s*(kg|cm|years|year|yrs|yr|yo|y/o)(?=[^\w/]|$)",
+    re.IGNORECASE,
+)
+
+
 def _label_numbers(text: str, nums: list[float]) -> Dict[str, float]:
-    """Best-effort: associate numbers with role labels by scanning units around them."""
+    """Associate numbers with role labels via the unit *immediately* after
+    each number.
+
+    The anchor matters: a wider window over-collects, so ``"165cm and 78kg"``
+    would otherwise also see ``kg`` for ``165``. The unit regex requires a
+    non-word, non-slash terminator (or end-of-string) so rate phrases like
+    ``"0.5kg/week"`` and lab values like ``"110 mg/dL"`` do not poison the
+    label set.
+    """
     labelled: Dict[str, float] = {}
     for m in _NUMBER_RE.finditer(text):
         n = float(m.group(0))
-        # Look at the next 12 chars after the number for a unit hint.
-        tail = text[m.end() : m.end() + 12].lower()
+        unit_match = _UNIT_AFTER_RE.match(text, m.end())
         head = text[max(0, m.start() - 25) : m.start()].lower()
-        if "kg" in tail and "weight_kg" not in labelled:
+
+        unit = unit_match.group(1).lower() if unit_match else ""
+        if unit == "kg" and "weight_kg" not in labelled:
             labelled["weight_kg"] = n
-        elif "cm" in tail and "height_cm" not in labelled:
+        elif unit == "cm" and "height_cm" not in labelled:
             labelled["height_cm"] = n
-        elif (
-            "year" in tail
-            or "years" in tail
-            or "yo" in tail
-            or "y/o" in tail
-            or "age" in head
-        ) and "age" not in labelled:
+        elif unit in {"year", "years", "yr", "yrs", "yo", "y/o"} and "age" not in labelled:
+            labelled["age"] = n
+        elif unit == "" and "age" in head and "age" not in labelled:
+            # Catches ``age 34`` / ``aged 34`` / ``age: 34``.
             labelled["age"] = n
     return labelled
 
@@ -552,11 +615,3 @@ class WebSearchTool:
         return f"{text}\n\nSources:\n" + "\n".join(lines)
 
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-# Note: ``execute_python_code_raw`` (subprocess-based) was REMOVED in Phase 4.
-# It executed LLM-generated Python on the host with no sandbox — a remote
-# code execution vector. Replaced by deterministic formulas + safe_math_eval.
-# ``search_web_raw`` (DDGS) was REMOVED in Phase 7+. Replaced by Gemini's
-# built-in ``google_search`` grounding via GeminiLLM.call_grounded().

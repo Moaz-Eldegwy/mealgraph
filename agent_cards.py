@@ -1,14 +1,14 @@
 """Agent cards — A2A-style capability descriptors.
 
-The Agent-to-Agent (A2A) protocol that emerged in 2025-26 standardises how
-agents discover each other's capabilities. Each agent publishes a "card"
-that declares: name, description, IO schemas, supported intents, and
-escalation policy. A registry collects them; an orchestrator (here, the
-Coach) looks up cards rather than hardcoding agent names.
+The Agent-to-Agent (A2A) pattern standardises how agents discover each
+other's capabilities. Each agent publishes a "card" that declares: name,
+description, IO schemas, supported intents, and escalation policy. A
+registry collects them; an orchestrator (here, the Coach) looks up cards
+rather than hardcoding agent names.
 
-Phase 5 ships the data model and a tiny in-process registry. A future
-phase can serve the registry over HTTP at ``/.well-known/agent-card.json``
-to enable cross-system collaboration.
+This module ships the data model and an in-process registry. The same
+registry can later be served over HTTP at
+``/.well-known/agent-card.json`` to enable cross-system collaboration.
 """
 
 from __future__ import annotations

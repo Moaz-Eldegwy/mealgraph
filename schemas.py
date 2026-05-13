@@ -1,24 +1,23 @@
 """Pydantic models for agent inputs and outputs.
 
-This module is the contract between the LLM, the orchestration layer, and the
-test suite. Every agent's decision now passes through one of these models — so:
+These models are the contract between the LLM, the orchestration layer,
+and the test suite:
 
 * Gemini's ``response_schema`` (constrained decoding) returns guaranteed-shape
-  JSON; we no longer rely on regex / ``json_repair`` for the high-stakes path.
-* Tests can construct decisions directly without hand-crafted JSON strings.
-* Phase 2 can split agent loops into LangGraph nodes that pass typed objects
-  between them.
+  JSON; the regex / ``json_repair`` path is a measured fallback only.
+* Tests construct decisions as typed objects, with no hand-crafted JSON.
+* Each agent loop can pass typed payloads between LangGraph nodes.
 
-Where Gemini's schema support is fussy (e.g. discriminated unions with
-``$ref``), we keep the outer envelope strict and leave per-action ``params``
-as a free dict — the agent dispatcher validates it at use time.
+Where Gemini's schema layer is limited (deep discriminated unions over
+``$ref`` definitions), the outer envelope is strict and ``params`` stays a
+free dict whose keys are validated by the dispatcher at use time.
 """
 
 from __future__ import annotations
 
 from typing import Any, Dict, List, Literal, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 
 # ---------------------------------------------------------------------------
@@ -73,9 +72,13 @@ CoachActionType = Literal[
 class CoachDecision(BaseModel):
     """Single turn of the Coach orchestrator.
 
-    Outer shape is strict; ``params`` is left as a dict because Gemini's
-    schema layer struggles with deeply discriminated unions. The dispatcher
-    in :mod:`workflow` validates ``params`` against the action type.
+    The outer envelope is strictly typed; ``params`` stays a free dict so a
+    single schema covers every action variant — the workflow dispatcher
+    validates the keys at use time. ``json_schema_extra`` declares the
+    possible keys to Gemini so structured decoding fills them rather than
+    returning an empty object (Gemini's ``response_schema`` does not accept
+    ``additionalProperties``, so the property list is the only available
+    hint).
     """
 
     observation: str
@@ -90,6 +93,17 @@ class CoachDecision(BaseModel):
             "ask_user={prompt}, write_memory={partition, data}, "
             "compose_response={text}."
         ),
+        json_schema_extra={
+            "properties": {
+                "agent_name": {"type": "string"},
+                "tool_name": {"type": "string"},
+                "task": {"type": "string"},
+                "prompt": {"type": "string"},
+                "partition": {"type": "string"},
+                "data": {"type": "object"},
+                "text": {"type": "string"},
+            },
+        },
     )
 
 
@@ -128,6 +142,26 @@ class MedicalAssessmentDecision(BaseModel):
     fields: List[str] = Field(default_factory=list)  # for ask_user
     result: Optional[MedicalAssessmentResult] = None  # for assessment_complete
 
+    @model_validator(mode="before")
+    @classmethod
+    def _infer_action_type(cls, data: Any) -> Any:
+        """Derive ``action_type`` from the populated discriminator fields.
+
+        Constrained decoding will sometimes emit ``tool_name``/``tool_task``
+        or ``result`` without the matching ``action_type`` discriminator;
+        infer it from whatever the model did populate so the dispatch logic
+        stays simple.
+        """
+        if not isinstance(data, dict) or data.get("action_type"):
+            return data
+        if data.get("result"):
+            data["action_type"] = "assessment_complete"
+        elif data.get("tool_name") or data.get("tool_task"):
+            data["action_type"] = "call_tool"
+        elif data.get("fields"):
+            data["action_type"] = "ask_user"
+        return data
+
 
 # ---------------------------------------------------------------------------
 # Planner Agent
@@ -159,6 +193,51 @@ class FinalPlan(BaseModel):
     trace: str = ""
 
 
+_PLAN_SCHEMA_HINT = {
+    "properties": {
+        # Gemini's ``response_schema`` requires ``items`` on every array
+        # and explicit ``properties`` on every nested object — without
+        # them, constrained decoding emits ``days: [{}]``. The Validator
+        # walks ``days`` recursively, so the flat-food list documented
+        # here is interchangeable with the nested ``List[List[FoodItem]]``
+        # form defined by :class:`FinalPlan`.
+        "days": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string"},
+                    "meal_group": {"type": "string"},
+                    "grams": {"type": "number"},
+                    "calories": {"type": "number"},
+                    "protein_g": {"type": "number"},
+                    "fat_g": {"type": "number"},
+                    "carbohydrates_g": {"type": "number"},
+                    "saturated_fat_g": {"type": "number"},
+                    "fiber_g": {"type": "number"},
+                },
+            },
+        },
+        "daily_totals": {
+            "type": "object",
+            "properties": {
+                "calories": {"type": "number"},
+                "protein_g": {"type": "number"},
+                "fat_g": {"type": "number"},
+                "carbohydrates_g": {"type": "number"},
+            },
+        },
+        "notes": {"type": "string"},
+        "sources": {
+            "type": "array",
+            "items": {"type": "string"},
+        },
+        "trace": {"type": "string"},
+        "error": {"type": "string"},
+    },
+}
+
+
 class PlannerDecision(BaseModel):
     """Per-iteration output of the Planner Agent loop."""
 
@@ -169,13 +248,47 @@ class PlannerDecision(BaseModel):
     action_type: PlannerActionType
     tool_name: Optional[str] = None
     tool_task: Optional[str] = None
-    drafted_plan: Optional[Dict[str, Any]] = None  # free shape pre-solver
-    final_plan: Optional[Dict[str, Any]] = None  # free shape until validation lands in Phase 2
+    drafted_plan: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description=(
+            "Free-shape draft plan (pre-solver). Typical shape: "
+            '{"days": [...]} or {"meals": [...]}.'
+        ),
+        json_schema_extra=_PLAN_SCHEMA_HINT,
+    )
+    final_plan: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description=(
+            "Free-shape final plan (post-solver). Typical shape: "
+            '{"days": [...], "daily_totals": {...}, "notes": "...", '
+            '"sources": [...], "trace": "..."}.'
+        ),
+        json_schema_extra=_PLAN_SCHEMA_HINT,
+    )
+
+    @model_validator(mode="before")
+    @classmethod
+    def _infer_action_type(cls, data: Any) -> Any:
+        """Derive ``action_type`` from the populated discriminator fields.
+
+        Mirrors :meth:`MedicalAssessmentDecision._infer_action_type`:
+        constrained decoding will sometimes emit
+        ``{observation, thought, planning_steps, final_plan}`` without an
+        ``action_type``; infer the intent so the agent loop can dispatch.
+        """
+        if not isinstance(data, dict) or data.get("action_type"):
+            return data
+        if data.get("final_plan"):
+            data["action_type"] = "provide_plan"
+        elif data.get("drafted_plan"):
+            data["action_type"] = "draft_plan"
+        elif data.get("tool_name") or data.get("tool_task"):
+            data["action_type"] = "call_tool"
+        return data
 
 
 # ---------------------------------------------------------------------------
-# Validation Agent (lands in Phase 2; defined here so Phase 1 schemas are
-# the single source of truth)
+# Validation Agent
 # ---------------------------------------------------------------------------
 ValidationVerdict = Literal["pass", "revise", "reject"]
 ValidationSeverity = Literal["low", "medium", "high"]

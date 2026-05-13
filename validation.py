@@ -1,16 +1,7 @@
 """ValidationAgent — the critic in the generator-critic loop.
 
-Why this exists
-----------------
-The original README promised a ``ValidationAgent`` but it was never
-implemented; the system shipped plans straight from the Planner to the user.
-Modern multi-agent literature (Anthropic's research-system writeup, every
-LangGraph reflection-pattern tutorial) is unanimous that a separate critic
-node materially raises output quality on tasks with hard constraints.
-
-Design
-------
-We combine two layers:
+The Validator grades the Planner's draft before the Coach commits to a
+final response, splitting the work across two layers:
 
 1. **Deterministic checks** (no LLM, no cost, instant):
    * allergy violations,
@@ -20,18 +11,19 @@ We combine two layers:
    * professional-consultation flag set without disclaimer.
 
 2. **LLM-graded checks** (one Gemini round-trip, structured output):
-   * medical-flag respect (e.g., diabetes user should avoid high-GL meals),
+   * medical-flag respect (e.g. diabetes user should avoid high-GL meals),
    * citation presence for clinical recommendations,
-   * cultural appropriateness against user's country/cuisine preference.
+   * cultural appropriateness against the user's country / cuisine preference.
 
 Verdict semantics
 -----------------
 * ``pass``   — Coach proceeds to ``compose_response``.
-* ``revise`` — Issues are bundled into the next Planner task; Coach loops back
-               to ``call_agent('PlannerAgent', task=...)``. Capped at 2
-               revisions (enforced by Coach prompt) to avoid infinite loops.
-* ``reject`` — Hard stop with ``severity='high'``. Coach must compose a
-               warning + HITL escalation chip (Phase 4 wires up the chip).
+* ``revise`` — Issues are bundled into the next Planner task; Coach loops
+               back to ``call_agent('PlannerAgent', task=...)``. Capped at
+               two revisions (enforced by the Coach prompt) to avoid
+               infinite loops.
+* ``reject`` — Hard stop with ``severity='high'``. The Coach composes a
+               warning and emits a human-in-the-loop escalation marker.
 """
 
 from __future__ import annotations

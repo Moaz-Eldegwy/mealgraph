@@ -41,6 +41,7 @@ ENV/
 logs/
 checkpoints/
 data/cache/
+audit_logs/
 *.sqlite
 *.sqlite3
 *.db

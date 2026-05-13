@@ -1,12 +1,14 @@
-"""LangGraph wiring for the Coach <-> action loop.
+"""LangGraph wiring for the Coach ↔ action loop.
 
-Phase 1 keeps the same two-node graph (``coach`` -> ``execute_action`` -> loop)
-so the public contract is unchanged. Phase 2 will explode this into subgraphs
-with parallel branches and a Validator critic loop.
+Two-node graph: ``coach`` produces a single typed decision (``CoachDecision``)
+and ``execute_action`` dispatches it to the right agent / tool / memory
+write, then loops back. Terminates on ``compose_response`` or ``ask_user``
+(or when ``max_turns`` is hit).
 """
 
 from __future__ import annotations
 
+import json
 from datetime import datetime
 from typing import Any, Dict
 
@@ -16,7 +18,7 @@ from langgraph.graph import END, StateGraph
 from config import get_settings
 from logging_setup import get_logger
 from state import NutritionState
-from utils import FileCheckpointSaver, set_nested
+from utils import FileCheckpointSaver, set_nested, update_memory_partition
 
 _logger = get_logger("workflow")
 
@@ -84,9 +86,29 @@ def execute_action_node(state: NutritionState, agents: Dict[str, Any], tools: Di
 
         if action_name == "write_memory":
             partition = params["partition"]
-            data = params["data"]
+            raw_data = params["data"]
+            # ``data`` is normally a dict; accept a JSON-encoded string too so
+            # alternative SDK shapes work without special-casing the agents.
+            if isinstance(raw_data, str):
+                try:
+                    data = json.loads(raw_data)
+                except json.JSONDecodeError as decode_err:
+                    raise ValueError(
+                        f"write_memory.data must be an object or JSON string; got: {raw_data!r}"
+                    ) from decode_err
+            else:
+                data = raw_data
+            if not isinstance(data, dict):
+                raise ValueError(f"write_memory.data must be an object, got {type(data).__name__}")
             updated_data = {**data, "last_updated": datetime.now().isoformat()}
-            set_nested(state["memory"], partition, updated_data)
+            # Top-level partitions (user_profile, medical_history, …) are
+            # merged so a partial update does not erase pre-existing keys.
+            # Dotted paths (``flags_and_assessments.last_validation``) are
+            # treated as a leaf assignment.
+            if "." in partition:
+                set_nested(state["memory"], partition, updated_data)
+            else:
+                update_memory_partition(state["memory"], partition, updated_data)
             state["previous_actions"].append(f"Wrote to memory partition: {partition}")
             return {**state, "agent_result": "Memory updated successfully"}
 

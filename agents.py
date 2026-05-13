@@ -1,13 +1,14 @@
 """Agent implementations.
 
-Phase 1: every agent's per-turn output is now a Pydantic model from
-``schemas``. The prompts are split so the static system rules sit in a
-module-level constant (eligible for Gemini's implicit prompt cache) and only
-the dynamic state changes per call.
+Every agent's per-turn output is a Pydantic model defined in :mod:`schemas`,
+so structured decoding produces objects the dispatcher can validate before
+acting. Each system prompt is a module-level constant — keeping it static
+makes it eligible for Gemini's implicit prompt cache; only the dynamic state
+varies per call.
 
-The action-dispatch loops are still *inside* the agent classes — Phase 2 will
-break them into LangGraph subgraphs with parallel tool nodes and the
-ValidationAgent critic loop.
+Action-dispatch loops live inside the agent classes here; the
+:class:`ValidationAgent` critic runs from :mod:`validation` and is invoked
+by the Coach between any Planner output and the final response.
 """
 
 from __future__ import annotations
@@ -30,6 +31,57 @@ from utils import save_to_json, should_debug, update_memory_partition
 _coach_logger = get_logger("agents.coach")
 _medical_logger = get_logger("agents.medical")
 _planner_logger = get_logger("agents.planner")
+
+
+def _decode_plan_field(value: Any) -> Optional[Dict[str, Any]]:
+    """Normalise a Planner plan field to a dict.
+
+    Structured decoding usually returns a dict, but mocked tests and some
+    SDK paths pass the same payload as a JSON-encoded string. Both shapes
+    flow through here, so the agent only ever sees ``Optional[dict]``.
+    """
+    if value is None:
+        return None
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return None
+        try:
+            decoded = json.loads(text)
+        except json.JSONDecodeError:
+            _planner_logger.warning(
+                "Planner plan field was not valid JSON; using raw string. Preview: %s",
+                text[:200],
+            )
+            return {"raw": text}
+        if isinstance(decoded, dict):
+            return decoded
+        return {"value": decoded}
+    return None
+
+
+def _is_plan_empty(plan: Dict[str, Any]) -> bool:
+    """True when ``plan`` contains no renderable content.
+
+    Catches the specific anti-pattern ``{"days": [{}]}`` that constrained
+    decoding can emit when the model fills the envelope but skips the body.
+    Anything with non-empty entries under ``days`` is accepted — clinical
+    quality is the Validator's job, not this guard's.
+    """
+    if not isinstance(plan, dict):
+        return True
+    days = plan.get("days")
+    # No days key or empty list -> empty.
+    if not days:
+        return True
+    if isinstance(days, list):
+        # Reject only the specific anti-pattern: every element is
+        # falsy / an empty dict.
+        if all(not isinstance(d, (dict, list)) or not d for d in days):
+            return True
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -466,9 +518,24 @@ Output JSON shape (enforced by schema):
   "final_plan": { ... } | null
 }
 
+Final-plan shape (MUST follow exactly when action_type="provide_plan"):
+- final_plan.days MUST be a non-empty list. Each element is a fully
+  populated food object copied from the QuantitiesFinder result, with
+  these keys at minimum: ``name`` (string), ``meal_group`` (string, e.g.
+  "breakfast" / "lunch" / "dinner" / "snack"), ``grams`` (number from the
+  solver's ``quantities``), ``calories`` (number = grams/100 * per_100g_kcal),
+  and the per-day-summed macros ``protein_g``, ``fat_g``, ``carbohydrates_g``.
+- final_plan.daily_totals mirrors the solver's ``achieved`` block:
+  {"calories": ..., "protein_g": ..., "fat_g": ..., "carbohydrates_g": ...}.
+- final_plan.sources lists the citation URIs (or labels) the WebSearchTool
+  returned for the foods used.
+- final_plan.trace summarises which agents/tools contributed.
+- An empty envelope (``{"days": [{}], "daily_totals": {}}``) is rejected
+  by the Validator as a high-severity violation; always transcribe the
+  solver output before returning.
+
 Notes:
 - Keep plans realistic and culturally appropriate (regional foods if provided).
-- Include a "trace" line in the final plan summarising agents/tools used.
 - Always echo the full updated planning_steps so they persist across turns.
 """
 
@@ -547,14 +614,15 @@ class PlannerAgent:
                 tool_results.append(f"{decision.tool_name}: {self._dispatch_tool(decision)}")
 
             elif decision.action_type == "draft_plan":
-                if decision.drafted_plan:
-                    memory.setdefault("plans", {})["drafted_plan"] = decision.drafted_plan
+                drafted = _decode_plan_field(decision.drafted_plan)
+                if drafted is not None:
+                    memory.setdefault("plans", {})["drafted_plan"] = drafted
                     tool_results.append("Plan drafted and stored in memory")
                 else:
                     tool_results.append("Drafted plan not provided")
 
             elif decision.action_type == "provide_plan":
-                final = decision.final_plan or memory.get("plans", {}).get("drafted_plan")
+                final = _decode_plan_field(decision.final_plan) or memory.get("plans", {}).get("drafted_plan")
 
                 # Error escape hatch (e.g. precondition not met)
                 if isinstance(final, dict) and "error" in final:
@@ -564,6 +632,17 @@ class PlannerAgent:
                 if not final:
                     tool_results.append("Cannot finalize: missing plan")
                     continue  # let the loop try another iteration
+
+                if _is_plan_empty(final):
+                    tool_results.append(
+                        "final_plan.days had no food entries. Transcribe the "
+                        "QuantitiesFinder quantities into days[] as fully "
+                        "populated food objects and emit provide_plan again."
+                    )
+                    _planner_logger.warning(
+                        "📋 Planner Agent: empty final_plan rejected; re-iterating."
+                    )
+                    continue
 
                 memory.setdefault("plans", {})
                 memory["plans"]["current_plan"] = final

@@ -1,14 +1,15 @@
 """KnowledgeAgent — citation-first retrieval over authoritative sources.
 
-Phase 3 wires the *interface* and a default WebSearch-backed implementation.
-Full RAG over USDA FoodData Central and WHO/ADA/EFSA PDFs is intentionally
-left as a follow-up (it requires bulk data ingestion + an embedding store).
-The seam is here so a later phase can drop in a real index without changing
-the agents that call it.
+The default implementation is backed by :class:`tools.WebSearchTool` and
+biases queries toward authoritative domains (USDA / WHO / ADA / EFSA /
+NICE) per kind. The interface is intentionally minimal so a RAG-backed
+variant over an embedded USDA + clinical-guideline index can drop in
+without touching the agents that call it.
 
-The contract is: every query returns a synthesised answer **with at least
-one citation**. The Validator will reject medical recommendations that lack
-a citation, so this agent is the safety story for clinical content.
+Contract: every response is a synthesised answer with at least one
+citation when the source supplies one. The Validator flags medical
+recommendations that arrive without citations, so this agent is the
+provenance layer for clinical content.
 """
 
 from __future__ import annotations

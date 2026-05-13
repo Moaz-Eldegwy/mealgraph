@@ -1,13 +1,12 @@
 """Closed-form nutrition formulas.
 
-Pure-Python deterministic calculations for BMI, BMR (Mifflin-St Jeor), TDEE,
-calorie targets, and macro splits. Used by the Phase 4 ``ComputationTool``
-to replace the previous LLM-generated ``subprocess.run(['python', ...])``
-path — closing the remote-code-execution vector.
+Pure-Python deterministic calculations for BMI, BMR (Mifflin-St Jeor),
+TDEE, calorie targets, and macro splits. Backs :class:`tools.ComputationTool`
+so clinical numbers never depend on LLM arithmetic.
 
-Numbers come from standard clinical guidelines (ACSM activity multipliers,
-Mifflin-St Jeor 1990 BMR equation). Conservative defaults; the Validator
-will still grade the resulting plan.
+Numbers come from standard clinical references (ACSM activity multipliers,
+Mifflin-St Jeor 1990 BMR equation). Conservative defaults — the Validator
+still grades the resulting plan.
 """
 
 from __future__ import annotations

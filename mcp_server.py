@@ -1,12 +1,12 @@
 """MCP server stub.
 
-The Model Context Protocol (MCP) is the de-facto standard, since late 2025,
-for exposing tools to any MCP-aware client (Claude Desktop, Cursor, ChatGPT,
-the Anthropic SDK, etc.). Phase 5 ships the *wrapping seam*: a single entry
-point that turns this project's tools into an MCP server.
+The Model Context Protocol (MCP) is the standard for exposing tools to
+any MCP-aware client (Claude Desktop, Cursor, ChatGPT, the Anthropic
+SDK, …). This module is the wrapping seam: a single entry point that
+turns this project's tools into an MCP server.
 
-The official Python SDK is the ``mcp`` package. We keep it as an OPTIONAL
-dependency so the demo doesn't pay the install cost unless the user opts in.
+The official Python SDK is the ``mcp`` package, kept as an OPTIONAL
+dependency so installs without MCP support do not pay the cost.
 
 Usage (after ``pip install mcp``)::
 

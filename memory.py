@@ -1,23 +1,22 @@
 """Long-term memory layer (semantic / procedural / episodic).
 
-Phase 3 deliberately uses stdlib ``sqlite3`` rather than Mem0 / Letta /
-sqlite-vec so the demo ships with zero extra dependencies. The interface,
-however, mirrors the modern three-tier taxonomy from the 2026 agent-memory
-literature so a later phase can swap the backend without touching call sites.
+Uses stdlib ``sqlite3`` so the project ships with no extra dependencies.
+The interface mirrors the three-tier taxonomy from the recent agent-memory
+literature, so an alternative backend (Mem0 / Letta / sqlite-vec) can
+replace this one without touching the call sites.
 
 Tiers
 -----
-* **Working** — kept in the LangGraph state (untouched by this module).
+* **Working** — held in the LangGraph state (untouched by this module).
 * **Semantic** — atomic facts about the user (likes, dislikes, hard
   constraints, lab results). Survives across sessions.
-* **Procedural** — verdicts the validator produced. Lets the system learn
+* **Procedural** — verdicts the validator produced. Lets the system note
   "this user rejected high-carb breakfasts twice" without re-asking.
 * **Episodic** — JSON snapshot of past sessions for replay / audit.
 
-Schema is intentionally tiny — three tables, one row per fact / verdict /
-session. Vector search is *not* needed for this demo; SQL ``LIKE`` over
-short text is good enough and adds zero dependencies. Phase 6 evals will
-make the case for upgrading.
+The schema is three tables, one row per fact / verdict / session. SQL
+``LIKE`` over short text is sufficient at the demo's scale; a vector
+backend can be added when retrieval recall becomes the bottleneck.
 """
 
 from __future__ import annotations

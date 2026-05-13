@@ -4,8 +4,7 @@ from __future__ import annotations
 
 
 def test_imports_work_outside_colab() -> None:
-    """The Phase 0 cleanup removed ``from google.colab import userdata``;
-    confirm every module can be imported in a plain Python process."""
+    """Every module imports cleanly in a plain Python process."""
     import agents  # noqa: F401
     import config  # noqa: F401
     import logging_setup  # noqa: F401
@@ -17,8 +16,7 @@ def test_imports_work_outside_colab() -> None:
 
 
 def test_only_one_geminillm_class_in_utils() -> None:
-    """Phase 0 deleted the duplicate ``GeminiLLM`` definition. Make sure it
-    doesn't sneak back."""
+    """A single ``GeminiLLM`` is exported from :mod:`utils` (no duplicates)."""
     import inspect
 
     import utils
@@ -40,8 +38,7 @@ def test_initialize_empty_memory_shape() -> None:
 
 
 def test_default_model_configs_present() -> None:
-    """Model topology is a contract the rest of the system depends on.
-    Phase 2 adds 'validation_agent' (Gemini Flash; cheap critic loop)."""
+    """Model topology is a contract the rest of the system depends on."""
     from nutritionmas import DEFAULT_MODEL_CONFIGS
 
     expected = {

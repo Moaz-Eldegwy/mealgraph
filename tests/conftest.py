@@ -1,9 +1,9 @@
 """Shared pytest fixtures.
 
-The mock LLM here is the workhorse for offline tests — it lets us run agents
-end-to-end without paying for Gemini calls. Phase 1 will give us schema-typed
-agent responses; until then, each test passes the raw JSON string the agent
-expects to receive.
+The mock LLM in this module is the workhorse for offline tests: it lets
+agents run end-to-end without paying for Gemini calls. Each test passes
+either typed Pydantic decisions (via ``call_typed``) or raw JSON strings
+(legacy paths) that the agent expects to receive.
 """
 
 from __future__ import annotations

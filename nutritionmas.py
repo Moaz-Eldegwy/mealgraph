@@ -138,8 +138,8 @@ def create_llm_instances(api_keys: list[str], model_overrides: Optional[Dict[str
         len(api_keys),
     )
 
-    # Note: previously this loop used a local variable named ``config`` which
-    # shadowed the imported ``config`` module — now ``cfg`` to avoid the trap.
+    # ``cfg`` (not ``config``) — the latter would shadow the imported
+    # :mod:`config` module inside the loop body.
     model_configs: Dict[str, Dict[str, Any]] = {}
     for key in DEFAULT_MODEL_CONFIGS:
         cfg = DEFAULT_MODEL_CONFIGS[key].copy()
@@ -190,15 +190,15 @@ def initialize_agents():
             PLANNER_LLM, TOOLS["ComputationTool"], TOOLS["WebSearchTool"], TOOLS["QuantitiesFinder"]
         ),
         "ValidationAgent": ValidationAgent(VALIDATION_LLM),
-        # KnowledgeAgent is the citation-first retrieval seam; defaults to
-        # WebSearch backing. Phase 3+ can swap in a RAG-backed implementation
-        # over USDA / WHO / ADA / EFSA without touching Coach call-sites.
+        # Citation-first retrieval seam; default backing is WebSearch. A
+        # RAG-backed implementation over USDA / WHO / ADA / EFSA can swap
+        # in without touching the Coach call sites.
         "KnowledgeAgent": KnowledgeAgent(TOOLS["WebSearchTool"]),
     }
 
 
 # ---------------------------------------------------------------------------
-# Long-term memory singleton (Phase 3)
+# Long-term memory singleton
 # ---------------------------------------------------------------------------
 LONG_TERM_MEMORY: Optional[LongTermMemory] = None
 
