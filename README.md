@@ -13,6 +13,8 @@ short_description: Multi-agent nutrition planner with LangGraph + Gemini
 
 # 🥗 Nutrition Multi-Agent System
 
+**Live demo:** <https://huggingface.co/spaces/moazeldegwy/mealgraph>
+
 A clinical-nutrition planner built on **LangGraph** and **Gemini 3.x**
 (`gemini-pro-latest` · `gemini-flash-latest` · `gemini-flash-lite-latest`).
 
