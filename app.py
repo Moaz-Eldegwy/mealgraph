@@ -12,15 +12,28 @@ Run locally::
 On Hugging Face Spaces, this file is the auto-detected entry point. The
 README's metadata block (sdk: gradio, app_file: app.py) tells the platform
 what to do.
+
+Two UX affordances on top of the bare-bones chat:
+
+* **Live progress panel** — a textbox that accumulates one line per agent
+  / tool start + finish, so the user can see what's happening without
+  opening the verbose trace accordion.
+* **Stop button** — signals a cooperative interrupt between agent /
+  tool steps. We can't kill a running Gemini HTTP request mid-flight,
+  but every ``handle_task`` checks the stop flag at entry, so the run
+  unwinds at the next boundary (typically within a few seconds) and the
+  chatbot receives a "stopped by user" message instead of an answer.
 """
 
 from __future__ import annotations
 
 import json
 import logging
+import queue
+import threading
 import traceback
 from io import StringIO
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 import gradio as gr
 
@@ -54,6 +67,171 @@ class SessionState:
 
 
 # ---------------------------------------------------------------------------
+# Progress + cooperative-stop machinery
+# ---------------------------------------------------------------------------
+class StopRequested(Exception):
+    """Raised inside an agent / tool wrapper when the user pressed Stop."""
+
+
+class ProgressBus:
+    """One per chat turn. Carries progress lines + a cooperative stop flag.
+
+    Producers (the agent / tool wrappers) push human-readable lines onto
+    ``queue`` and call :meth:`check_stop` at the start of each step. The
+    consumer (the chat generator) drains ``queue`` and yields each line
+    to the UI. The sentinel value ``None`` signals "no more events".
+    """
+
+    def __init__(self) -> None:
+        self.queue: "queue.Queue[Optional[str]]" = queue.Queue()
+        self.stop_event = threading.Event()
+
+    def emit(self, line: str) -> None:
+        self.queue.put(line)
+
+    def check_stop(self) -> None:
+        if self.stop_event.is_set():
+            raise StopRequested("user requested stop")
+
+    def end(self) -> None:
+        self.queue.put(None)
+
+
+# Module-global handle on the currently-running run. The Stop button uses
+# it to flip the stop flag on the active bus. Guarded by a lock so a
+# concurrent Stop press and chat-start can't race.
+_CURRENT_BUS: Optional[ProgressBus] = None
+_CURRENT_BUS_LOCK = threading.Lock()
+
+
+def _set_current_bus(bus: Optional[ProgressBus]) -> None:
+    global _CURRENT_BUS
+    with _CURRENT_BUS_LOCK:
+        _CURRENT_BUS = bus
+
+
+def _peek_current_bus() -> Optional[ProgressBus]:
+    with _CURRENT_BUS_LOCK:
+        return _CURRENT_BUS
+
+
+def request_stop() -> str:
+    """Stop-button handler. Signals the current run; safe no-op if none."""
+    bus = _peek_current_bus()
+    if bus is None:
+        return "ℹ️ No run is in progress."
+    bus.stop_event.set()
+    return "🛑 Stop requested — unwinding at next agent/tool boundary…"
+
+
+# Display labels for the three agents. Anything not in this map falls
+# through to the raw class name, which is fine for debugging.
+_AGENT_LABELS = {
+    "CoachAgent": "🏋️ Coach",
+    "MedicalAssessmentAgent": "👨‍⚕️ Medical Assessment",
+    "PlannerAgent": "📋 Planner",
+}
+_TOOL_LABELS = {
+    "WebSearchTool": "🌐 WebSearchTool",
+    "QuantitiesFinder": "📊 QuantitiesFinder",
+}
+
+
+def _install_progress_hooks() -> None:
+    """Idempotent: wrap every agent/tool's ``handle_task`` once.
+
+    Each wrapper:
+    1. Reads the current bus from the module global (``None`` outside a
+       chat turn, in which case the wrapper is transparent).
+    2. Calls ``bus.check_stop()`` to honour a pending stop request.
+    3. Emits a start line, runs the original, emits a finish line.
+    4. For the Coach specifically, decodes the chosen action so the
+       progress panel can show "Coach → MedicalAssessmentAgent" rather
+       than the opaque "Coach: done".
+    """
+    if mealgraph.AGENTS is None or mealgraph.TOOLS is None:
+        return  # system not initialised yet
+
+    for name, agent in mealgraph.AGENTS.items():
+        _wrap_agent(name, agent)
+    for name, tool in mealgraph.TOOLS.items():
+        _wrap_tool(name, tool)
+
+
+def _wrap_agent(name: str, agent: Any) -> None:
+    if getattr(agent, "_progress_wrapped", False):
+        return
+    label = _AGENT_LABELS.get(name, name)
+    orig = agent.handle_task
+
+    def traced(*args: Any, **kwargs: Any) -> Any:
+        bus = _peek_current_bus()
+        if bus is not None:
+            bus.check_stop()
+            bus.emit(f"⏳ {label}: starting…")
+        try:
+            result = orig(*args, **kwargs)
+            if bus is not None:
+                bus.emit(_summarise_agent_result(name, label, result))
+            return result
+        except StopRequested:
+            if bus is not None:
+                bus.emit(f"🛑 {label}: interrupted")
+            raise
+
+    agent.handle_task = traced  # type: ignore[method-assign]
+    agent._progress_wrapped = True  # type: ignore[attr-defined]
+
+
+def _wrap_tool(name: str, tool: Any) -> None:
+    if getattr(tool, "_progress_wrapped", False):
+        return
+    label = _TOOL_LABELS.get(name, name)
+    orig = tool.handle_task
+
+    def traced(task: str) -> str:
+        bus = _peek_current_bus()
+        if bus is not None:
+            bus.check_stop()
+            bus.emit(f"  └─ {label}: running…")
+        try:
+            result = orig(task)
+            if bus is not None:
+                bus.emit(f"  └─ {label}: done")
+            return result
+        except StopRequested:
+            if bus is not None:
+                bus.emit(f"  └─ {label}: interrupted")
+            raise
+
+    tool.handle_task = traced  # type: ignore[method-assign]
+    tool._progress_wrapped = True  # type: ignore[attr-defined]
+
+
+def _summarise_agent_result(name: str, label: str, result: Any) -> str:
+    """One-line summary of an agent step for the progress panel.
+
+    The Coach's ``handle_task`` returns the full updated state dict,
+    which includes ``current_action`` — surfacing it makes the trace
+    much easier to follow ("Coach → Planner" beats "Coach: done").
+    Workers return free-form text, so we fall back to "done".
+    """
+    if name == "CoachAgent" and isinstance(result, dict):
+        action = (result.get("current_action") or {}).get("action")
+        params = (result.get("current_action") or {}).get("params") or {}
+        if action == "call_agent":
+            return f"✓ Coach → {params.get('agent_name', '?')}: {params.get('task', '')[:80]}"
+        if action == "ask_user":
+            return f"✓ Coach: asking user — {params.get('prompt', '')[:80]}"
+        if action == "compose_response":
+            return "✓ Coach: composing final answer"
+        if action == "write_memory":
+            return f"✓ Coach: write memory ({params.get('partition', '?')})"
+        return f"✓ {label}: {action or 'done'}"
+    return f"✓ {label}: done"
+
+
+# ---------------------------------------------------------------------------
 # Bootstrapping
 # ---------------------------------------------------------------------------
 def initialise_system(
@@ -84,6 +262,9 @@ def initialise_system(
         mealgraph.setup_workflow()
         mealgraph.initialize_long_term_memory()
         init_langsmith()
+        # Install progress + stop hooks last so every agent / tool we
+        # just wired up gets wrapped exactly once.
+        _install_progress_hooks()
         return (
             f"✅ System initialised with {len(keys)} key(s). "
             f"Coach={coach_model}, Workers={workers_model}, Tools (WebSearch)={tools_model}."
@@ -163,75 +344,121 @@ def build_user_profile(
 
 
 # ---------------------------------------------------------------------------
-# Chat handler
+# Chat handler (streaming generator)
 # ---------------------------------------------------------------------------
+ChatYield = Tuple[List[Dict[str, str]], str, str, SessionState, str]
+
+
 def chat(
     user_message: str,
     history: List[Dict[str, str]],
     session: SessionState,
     profile_json: str,
-) -> Tuple[List[Dict[str, str]], str, str, SessionState]:
-    """Single-turn handler. Returns (chat_history, trace_log, metrics_md, session).
+) -> Iterator[ChatYield]:
+    """Streaming handler. Yields ``(chat, trace, metrics, session, progress)``.
 
-    Uses Gradio 5+ "messages" Chatbot format: ``[{"role": "user"/"assistant",
-    "content": "..."}, ...]``.
+    Runs the LangGraph workflow on a background thread and pulls progress
+    lines off the ProgressBus as they arrive. Each yield updates the UI;
+    the final yield carries the composed answer.
     """
     if session is None:
         session = SessionState()
     if not history:
         history = []
     history = history + [{"role": "user", "content": user_message}]
+
     if mealgraph.APP is None:
         history.append(
             {"role": "assistant", "content": "❌ System not initialised. Use the sidebar Initialize button."}
         )
-        return history, "", "", session
+        yield history, "", "", session, "(system not initialised)"
+        return
 
     # Update profile if user changed it.
     try:
         profile_data = json.loads(profile_json) if profile_json.strip() else {}
         if profile_data:
-            session.memory["user_profile"] = profile_data.get("user_profile", session.memory["user_profile"])
+            session.memory["user_profile"] = profile_data.get(
+                "user_profile", session.memory["user_profile"]
+            )
             session.memory["medical_history"] = profile_data.get(
                 "medical_history", session.memory["medical_history"]
             )
     except json.JSONDecodeError:
         pass
 
-    handler = _attach_buffer()
-    final_response = ""
-    error_text = ""
-    try:
-        state = {
-            "memory": session.memory,
-            "user_question": user_message,
-            "conversation_history": session.conversation_history
-            + [{"role": "user", "content": user_message}],
-            "current_action": None,
-            "agent_result": None,
-            "num_turns": 0,
-            "max_turns": 12,
-            "previous_actions": session.previous_actions,
-            "response_steps": [],
-        }
-        with span("end_to_end_chat", kind="agent"):
-            final_state = mealgraph.APP.invoke(
-                state, config={"configurable": {"thread_id": session.thread_id}}
-            )
+    bus = ProgressBus()
+    _set_current_bus(bus)
+    log_handler = _attach_buffer()
+
+    state = {
+        "memory": session.memory,
+        "user_question": user_message,
+        "conversation_history": session.conversation_history
+        + [{"role": "user", "content": user_message}],
+        "current_action": None,
+        "agent_result": None,
+        "num_turns": 0,
+        "max_turns": 12,
+        "previous_actions": session.previous_actions,
+        "response_steps": [],
+    }
+
+    result_holder: Dict[str, Any] = {}
+
+    def runner() -> None:
+        try:
+            with span("end_to_end_chat", kind="agent"):
+                final_state = mealgraph.APP.invoke(
+                    state, config={"configurable": {"thread_id": session.thread_id}}
+                )
+            result_holder["state"] = final_state
+        except StopRequested:
+            result_holder["stopped"] = True
+        except Exception as e:  # noqa: BLE001
+            result_holder["error"] = e
+        finally:
+            bus.end()
+
+    worker = threading.Thread(target=runner, daemon=True)
+    worker.start()
+
+    progress: List[str] = ["⏳ Starting workflow…"]
+    # Initial yield so the UI clears the previous progress and shows the
+    # first "Starting workflow" line immediately.
+    yield history, log_handler.text(), "", session, "\n".join(progress)
+
+    while True:
+        line = bus.queue.get()
+        if line is None:
+            break
+        progress.append(line)
+        yield history, log_handler.text(), "", session, "\n".join(progress)
+
+    worker.join(timeout=5)
+    _detach_buffer(log_handler)
+    _set_current_bus(None)
+
+    # Final yield: append the assistant message to the chat and refresh
+    # metrics. Branches over stopped / error / success.
+    if result_holder.get("stopped"):
+        progress.append("🛑 Run stopped by user.")
+        history.append({"role": "assistant", "content": "🛑 Stopped by user before a plan was finalised."})
+    elif "error" in result_holder:
+        err = result_holder["error"]
+        progress.append(f"⚠ Error: {err}")
+        history.append({"role": "assistant", "content": f"⚠ Error: {err}"})
+    else:
+        final_state = result_holder["state"]
         session.memory = final_state["memory"]
         session.conversation_history = final_state["conversation_history"]
         session.previous_actions = final_state["previous_actions"]
         final_response = final_state.get("agent_result") or "(no response)"
-    except Exception as e:  # noqa: BLE001
-        error_text = f"\n\n⚠ Error: {e}"
-    finally:
-        log_text = handler.text()
-        _detach_buffer(handler)
+        history.append({"role": "assistant", "content": str(final_response)})
+        progress.append("✅ Done.")
 
-    history.append({"role": "assistant", "content": str(final_response) + error_text})
-    metrics = get_metrics().snapshot()
-    metrics_md = _render_metrics(metrics)
-    return history, log_text, metrics_md, session
+    metrics_md = _render_metrics(get_metrics().snapshot())
+    yield history, log_handler.text(), metrics_md, session, "\n".join(progress)
 
 
 def _render_metrics(snap: Dict[str, Any]) -> str:
@@ -388,7 +615,19 @@ def build_demo() -> gr.Blocks:
                     placeholder="e.g. Build me a one-day meal plan to gain muscle.",
                     lines=2,
                 )
-                send_btn = gr.Button("Send", variant="primary")
+                with gr.Row():
+                    send_btn = gr.Button("Send", variant="primary", scale=3)
+                    stop_btn = gr.Button("⏹ Stop", variant="stop", scale=1)
+                # Plain-text progress feed: one short line per agent / tool
+                # step. Kept separate from the verbose trace below so the
+                # casual viewer sees a clean timeline.
+                progress_panel = gr.Textbox(
+                    label="Live progress",
+                    lines=10,
+                    interactive=False,
+                    placeholder="Each agent / tool step will appear here as the workflow runs.",
+                )
+                stop_status = gr.Markdown(visible=False)
                 with gr.Accordion("🔍 Agent activity (live trace)", open=False):
                     trace_log = gr.Textbox(label="Log", lines=12, interactive=False)
                 with gr.Accordion("📈 System metrics", open=False):
@@ -401,16 +640,42 @@ def build_demo() -> gr.Blocks:
             inputs=[api_keys, coach_model, workers_model, tools_model, rate_limit, debug_on],
             outputs=init_status,
         )
-        send_btn.click(
-            chat,
-            inputs=[user_input, chatbot, session_state, profile_json],
-            outputs=[chatbot, trace_log, metrics_md, session_state],
+
+        # The chat handler is a generator now (streams progress events),
+        # so Gradio will hold the connection open and re-render on each
+        # yield. We capture the click and submit event handles so the
+        # Stop button can ``cancels=`` them — Gradio will tear down the
+        # generator on the server side as soon as Stop is clicked, while
+        # our own bus.stop_event makes the background workflow unwind
+        # cleanly at the next agent / tool boundary.
+        chat_inputs = [user_input, chatbot, session_state, profile_json]
+        chat_outputs = [chatbot, trace_log, metrics_md, session_state, progress_panel]
+        send_event = send_btn.click(
+            chat, inputs=chat_inputs, outputs=chat_outputs
         ).then(lambda: "", None, user_input)
-        user_input.submit(
-            chat,
-            inputs=[user_input, chatbot, session_state, profile_json],
-            outputs=[chatbot, trace_log, metrics_md, session_state],
+        submit_event = user_input.submit(
+            chat, inputs=chat_inputs, outputs=chat_outputs
         ).then(lambda: "", None, user_input)
+
+        # Stop button: flip the bus flag + cancel the Gradio-side
+        # generator. ``cancels=`` is best-effort across Gradio versions;
+        # the bus flag is the actual stop signal.
+        stop_btn.click(
+            request_stop,
+            inputs=None,
+            outputs=stop_status,
+        )
+        # Wire ``cancels`` in a try / except — older Gradio releases
+        # don't accept it on a separate ``.click()`` chain.
+        try:
+            stop_btn.click(  # type: ignore[call-arg]
+                lambda: gr.update(visible=True),
+                inputs=None,
+                outputs=stop_status,
+                cancels=[send_event, submit_event],
+            )
+        except TypeError:
+            pass
 
         gr.Markdown(
             """

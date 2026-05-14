@@ -82,7 +82,12 @@ def test_session_state_default_shape() -> None:
 
 
 def test_chat_handles_uninitialised_system() -> None:
-    """Calling chat() before init must not crash; returns a friendly error."""
+    """Calling chat() before init must not crash; returns a friendly error.
+
+    ``chat`` is a generator that streams (chat, trace, metrics, session,
+    progress) tuples — drain to the last yield and inspect the final
+    chatbot history.
+    """
     pytest.importorskip("gradio")
     from app import SessionState, chat
 
@@ -90,9 +95,41 @@ def test_chat_handles_uninitialised_system() -> None:
     import mealgraph
     mealgraph.APP = None
 
-    history, log, metrics, session = chat(
+    last = None
+    for last in chat(
         user_message="hi", history=[], session=SessionState(), profile_json=""
-    )
+    ):
+        pass
+    assert last is not None
+    history, _log, _metrics, _session, progress = last
     # messages-format chatbot: list of {role, content} dicts
     assert history[-1]["role"] == "assistant"
     assert history[-1]["content"].startswith("❌ System not initialised")
+    # Progress panel should explain the early exit, not be empty.
+    assert "system not initialised" in progress.lower()
+
+
+def test_request_stop_with_no_active_run() -> None:
+    """Pressing Stop with no in-flight run is a friendly no-op."""
+    pytest.importorskip("gradio")
+    from app import request_stop, _set_current_bus
+
+    # Make sure no leftover bus from another test is hanging around.
+    _set_current_bus(None)
+    msg = request_stop()
+    assert "No run is in progress" in msg
+
+
+def test_progress_bus_check_stop_raises_after_set() -> None:
+    """ProgressBus.check_stop is the gate every agent / tool wrapper hits
+    on entry. Once the stop flag is flipped, the next check raises so the
+    in-flight workflow unwinds at the next agent / tool boundary."""
+    pytest.importorskip("gradio")
+    from app import ProgressBus, StopRequested
+
+    bus = ProgressBus()
+    # Fresh bus: no raise.
+    bus.check_stop()
+    bus.stop_event.set()
+    with pytest.raises(StopRequested):
+        bus.check_stop()
