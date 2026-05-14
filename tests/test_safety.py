@@ -1,12 +1,15 @@
-"""Tests for the safety surface: deterministic ComputationTool +
-guardrails (prompt-injection sniff, PII redaction, HITL chip)."""
+"""Tests for the safety surface: closed-form clinical formulas and
+guardrails (prompt-injection sniff, PII redaction, HITL chip).
+
+The Computation tool / AST sandbox / safe_math_eval are no longer wired
+into the system — clinical math runs directly through
+:mod:`nutrition_formulas` from inside the MedicalAssessmentAgent — so the
+related tests have been removed. The formula coverage stays.
+"""
 
 from __future__ import annotations
 
-import json
 import math
-
-import pytest
 
 from guardrails import (
     HITL_MARKER,
@@ -23,7 +26,6 @@ from nutrition_formulas import (
     macro_split,
     tdee,
 )
-from tools import ComputationTool, safe_math_eval
 
 
 # ---- Closed-form formulas --------------------------------------------------
@@ -69,78 +71,6 @@ def test_full_assessment_smoke() -> None:
     )
     assert {"BMI", "BMR", "TDEE", "daily_target_calories", "macro_targets"} <= result.keys()
     assert result["BMI"] > 0
-
-
-# ---- ComputationTool dispatch (no LLM, no subprocess) ----------------------
-def test_computation_tool_structured_op() -> None:
-    tool = ComputationTool()
-    out = json.loads(tool.handle_task('{"op": "bmi", "weight_kg": 70, "height_cm": 175}'))
-    assert "BMI" in out and out["BMI"] > 0
-
-
-def test_computation_tool_full_assessment() -> None:
-    tool = ComputationTool()
-    payload = {
-        "op": "full_assessment",
-        "weight_kg": 75,
-        "height_cm": 180,
-        "age_years": 30,
-        "sex": "male",
-        "activity_level": "moderately active",
-        "goal": "gain muscle",
-    }
-    out = json.loads(tool.handle_task(json.dumps(payload)))
-    assert "macro_targets" in out
-    assert out["daily_target_calories"] > 0
-
-
-def test_computation_tool_safe_math_eval_op() -> None:
-    tool = ComputationTool()
-    out = json.loads(tool.handle_task('{"op": "eval", "expression": "2700 * 0.30 / 4"}'))
-    assert math.isclose(out["result"], 202.5, abs_tol=0.01)
-
-
-def test_computation_tool_unknown_op_returns_error() -> None:
-    tool = ComputationTool()
-    out = json.loads(tool.handle_task('{"op": "spawn_evil_subprocess"}'))
-    assert "error" in out
-
-
-def test_computation_tool_no_subprocess_for_arbitrary_text() -> None:
-    """Even if an attacker passes a python snippet, NO subprocess runs;
-    the parser returns a structured error instead."""
-    tool = ComputationTool()
-    malicious = "import os; os.system('rm -rf /')"
-    out = json.loads(tool.handle_task(malicious))
-    assert "error" in out
-
-
-# ---- Safe math eval --------------------------------------------------------
-def test_safe_math_eval_ok() -> None:
-    assert safe_math_eval("2 + 3 * 4") == 14
-    assert safe_math_eval("(2 + 3) * 4") == 20
-    assert safe_math_eval("10 / 4") == 2.5
-    assert safe_math_eval("2 ** 8") == 256
-
-
-def test_safe_math_eval_blocks_names() -> None:
-    with pytest.raises(ValueError):
-        safe_math_eval("__import__('os').system('rm -rf /')")
-
-
-def test_safe_math_eval_blocks_calls() -> None:
-    with pytest.raises(ValueError):
-        safe_math_eval("print(1)")
-
-
-def test_safe_math_eval_blocks_attribute() -> None:
-    with pytest.raises(ValueError):
-        safe_math_eval("(1).bit_length()")
-
-
-def test_safe_math_eval_length_capped() -> None:
-    with pytest.raises(ValueError):
-        safe_math_eval("1+" * 200 + "1")
 
 
 # ---- Prompt-injection detector --------------------------------------------

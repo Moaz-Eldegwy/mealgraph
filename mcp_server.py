@@ -23,12 +23,16 @@ To register with Claude Desktop, add to ``~/.config/claude/desktop.json``::
         }
       }
     }
+
+Only the two genuinely portable surfaces are exposed: the LP-backed
+:class:`tools.QuantitiesFinder` and the closed-form
+:func:`nutrition_formulas.full_assessment`. There is no LLM-driven
+computation tool to wrap — clinical math runs directly in Python.
 """
 
 from __future__ import annotations
 
 import json
-import sys
 from typing import Any, Dict
 
 
@@ -42,11 +46,10 @@ def _build_server() -> Any:
         ) from e
 
     from nutrition_formulas import full_assessment as _full_assessment
-    from tools import ComputationTool, QuantitiesFinder, safe_math_eval
+    from tools import QuantitiesFinder
 
     server = FastMCP("mealgraph")
     qf = QuantitiesFinder()
-    comp = ComputationTool()
 
     # ----- QuantitiesFinder ------------------------------------------------
     @server.tool()
@@ -64,30 +67,7 @@ def _build_server() -> Any:
         """
         return qf.handle_task(json.dumps(payload))
 
-    # ----- ComputationTool (deterministic) ---------------------------------
-    @server.tool()
-    def nutrition_calculation(op: str, args: Dict[str, Any]) -> str:
-        """Closed-form clinical formulas (BMI, BMR, TDEE, ...).
-
-        Args:
-            op: 'bmi' | 'bmr' | 'tdee' | 'calorie_target' | 'macro_split' |
-                'full_assessment' | 'eval'
-            args: kwargs for the chosen op (see nutrition_formulas).
-
-        Returns:
-            JSON result for the op.
-        """
-        return comp.handle_task(json.dumps({"op": op, **args}))
-
-    @server.tool()
-    def safe_math(expression: str) -> float:
-        """Evaluate a numeric expression in a strict AST sandbox.
-
-        Allowed: literals, + - * / // % **, unary + -, parentheses.
-        Forbidden: names, calls, attributes, subscripts.
-        """
-        return safe_math_eval(expression)
-
+    # ----- Closed-form clinical assessment ---------------------------------
     @server.tool()
     def assess_user(
         weight_kg: float,
@@ -100,7 +80,9 @@ def _build_server() -> Any:
         """One-shot anthropometric + nutritional assessment.
 
         Returns BMI, BMR, TDEE, daily_target_calories, and macro_targets
-        (protein_g, fat_g, carbohydrates_g).
+        (protein_g, fat_g, carbohydrates_g). Deterministic closed-form
+        formulas (Mifflin-St Jeor BMR, ACSM activity multipliers); no LLM
+        in the path.
         """
         return _full_assessment(
             weight_kg=weight_kg,

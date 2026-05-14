@@ -15,7 +15,6 @@ from schemas import (
     MedicalAssessmentResult,
     PlannerDecision,
     ResponseStep,
-    ValidationDecision,
 )
 
 
@@ -42,6 +41,21 @@ def test_coach_decision_invalid_action_rejected() -> None:
             response_steps=[],
             action="not_a_real_action",  # type: ignore[arg-type]
             params={},
+        )
+
+
+def test_coach_decision_call_tool_rejected() -> None:
+    """The Coach has no call_tool action in the 3-agent topology — tools
+    are owned by the worker agents. A Coach decision that tries to call a
+    tool directly must fail at parse time so the system can't be tricked
+    into bypassing the agent's safety checks."""
+    with pytest.raises(ValidationError):
+        CoachDecision(
+            observation="x",
+            thought="x",
+            response_steps=[],
+            action="call_tool",  # type: ignore[arg-type]
+            params={"tool_name": "QuantitiesFinder", "task": "..."},
         )
 
 
@@ -128,8 +142,15 @@ def test_final_plan_minimal() -> None:
     assert plan.days[0][0].name == "oats"
 
 
-# ---- Validation ------------------------------------------------------------
-def test_validation_decision_default_pass() -> None:
-    v = ValidationDecision(verdict="pass")
-    assert v.verdict == "pass"
-    assert v.issues == []
+# ---- Planner tool name (Literal enforcement) -------------------------------
+def test_planner_decision_unknown_tool_rejected() -> None:
+    """``tool_name`` is a strict Literal so a misroute fails at parse time."""
+    with pytest.raises(ValidationError):
+        PlannerDecision(
+            observation="x",
+            thought="x",
+            planning_steps=[],
+            action_type="call_tool",
+            tool_name="ComputationTool",  # type: ignore[arg-type]
+            tool_task="...",
+        )

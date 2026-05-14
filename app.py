@@ -73,7 +73,6 @@ def initialise_system(
         "main": {"model_name": coach_model},
         "agents_llm": {"model_name": workers_model},
         "planner_agent": {"model_name": workers_model},
-        "validation_agent": {"model_name": tools_model},
         "tools_llm": {"model_name": tools_model},
     }
     try:
@@ -87,7 +86,7 @@ def initialise_system(
         init_langsmith()
         return (
             f"✅ System initialised with {len(keys)} key(s). "
-            f"Coach={coach_model}, Workers={workers_model}, Tools/Validator={tools_model}."
+            f"Coach={coach_model}, Workers={workers_model}, Tools (WebSearch)={tools_model}."
         )
     except Exception as e:  # noqa: BLE001
         return f"❌ Initialisation failed: {e}\n\n{traceback.format_exc()}"
@@ -263,11 +262,13 @@ def build_demo() -> gr.Blocks:
     with gr.Blocks(title="MealGraph — Multi-Agent Demo") as demo:
         gr.Markdown(
             """
-            # 🥗 Nutrition Multi-Agent System
-            A LangGraph + Gemini orchestrator that delegates to a Medical
-            Assessment specialist, a Planner (with a PuLP linear-program meal
-            solver), a Validator critic, and a citation-first Knowledge
-            agent. Bring your own Gemini API keys.
+            # 🥗 MealGraph — Nutrition Multi-Agent System
+            A LangGraph + Gemini orchestrator: a **Coach** delegates to a
+            **Medical Assessment** specialist (deterministic clinical
+            formulas + LLM interpretation) and a **Planner** that combines
+            grounded web search with a PuLP linear-program meal solver
+            and runs its own post-solve safety check (allergy / calorie /
+            macro tolerances). Bring your own Gemini API keys.
             """
         )
 
@@ -303,7 +304,7 @@ def build_demo() -> gr.Blocks:
                     value="gemini-pro-latest",
                 )
                 tools_model = gr.Dropdown(
-                    label="Validator / Tools model",
+                    label="Tools (WebSearch) model",
                     choices=_GEMINI_MODELS,
                     value="gemini-flash-lite-latest",
                 )
@@ -367,10 +368,21 @@ def build_demo() -> gr.Blocks:
 
             # ---------------- Main pane ----------------
             with gr.Column(scale=2):
-                # Gradio 6 dropped the `type=` parameter; the messages format
-                # ([{role, content}]) is now the only one. Older versions still
-                # accept `type="messages"` so we keep the same payload shape.
-                chatbot = gr.Chatbot(label="Conversation", height=420)
+                # Gradio 5+ defaults to the "tuples" format when ``type`` is
+                # omitted, which clashes with our messages-shaped payload
+                # ([{role, content}, ...]) and triggers a postprocess error
+                # on the first turn. Pin ``type="messages"`` explicitly; the
+                # arg is accepted by 4.40+ and is the only valid choice in
+                # Gradio 6.
+                try:
+                    chatbot = gr.Chatbot(
+                        label="Conversation", height=420, type="messages"
+                    )
+                except TypeError:
+                    # Pre-4.40 Gradio doesn't know the ``type`` kwarg; fall
+                    # back to the default and let the tuples postprocessor
+                    # handle the legacy shape.
+                    chatbot = gr.Chatbot(label="Conversation", height=420)
                 user_input = gr.Textbox(
                     label="Your question",
                     placeholder="e.g. Build me a one-day meal plan to gain muscle.",
@@ -403,12 +415,14 @@ def build_demo() -> gr.Blocks:
         gr.Markdown(
             """
             ---
-            **About**: This demo runs a 5-agent system (Coach, Medical
-            Assessment, Planner, Validation, Knowledge). The Validator
-            applies *deterministic* checks (allergy violations, calorie /
-            macro tolerances, HITL escalation) plus an LLM-graded layer for
-            medical-flag respect and citation presence. See the GitHub repo
-            for the full architecture writeup.
+            **About**: This demo runs a 3-agent system (Coach, Medical
+            Assessment, Planner) on top of two safe-by-construction tools
+            (PuLP `QuantitiesFinder`, Gemini-grounded `WebSearchTool`). The
+            Planner runs its own *deterministic* check (allergy / calorie /
+            macro tolerances) after the LP solver and self-revises up to
+            twice. The Coach then does an LLM-graded self-review (medical
+            flag respect, citation presence, cultural fit) before composing.
+            See the GitHub repo for the full architecture writeup.
             """
         )
     return demo

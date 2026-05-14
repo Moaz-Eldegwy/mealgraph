@@ -38,7 +38,13 @@ def test_initialize_empty_memory_shape() -> None:
 
 
 def test_default_model_configs_present() -> None:
-    """Model topology is a contract the rest of the system depends on."""
+    """Model topology is a contract the rest of the system depends on.
+
+    Five slots in the 3-agent architecture: Coach + Medical + Planner LLMs,
+    one tools LLM for grounded WebSearch, and a user_simulator for the eval
+    harness. There is no dedicated ``validation_agent`` slot — the Validator
+    was folded into the Planner / Coach.
+    """
     from mealgraph import DEFAULT_MODEL_CONFIGS
 
     expected = {
@@ -46,7 +52,6 @@ def test_default_model_configs_present() -> None:
         "agents_llm",
         "tools_llm",
         "planner_agent",
-        "validation_agent",
         "user_simulator",
     }
     assert set(DEFAULT_MODEL_CONFIGS.keys()) == expected

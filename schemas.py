@@ -31,8 +31,8 @@ class ResponseStep(BaseModel):
 
     id: int
     actor: str = Field(
-        description="Who executes this step. Examples: 'CoachAgent', 'MedicalAssessmentAgent', "
-        "'PlannerAgent', 'ValidationAgent', 'user'.",
+        description="Who executes this step. Examples: 'CoachAgent', "
+        "'MedicalAssessmentAgent', 'PlannerAgent', 'user'.",
     )
     description: str
     prerequisites: List[str] = Field(default_factory=list)
@@ -60,9 +60,11 @@ class Calculations(BaseModel):
 # ---------------------------------------------------------------------------
 # Coach Agent
 # ---------------------------------------------------------------------------
+# Coach dispatches agents, asks the user, writes memory, or composes. Tools
+# are exclusively internal to the worker agents — the Coach never calls one
+# directly, so ``call_tool`` is intentionally absent.
 CoachActionType = Literal[
     "call_agent",
-    "call_tool",
     "ask_user",
     "write_memory",
     "compose_response",
@@ -89,14 +91,12 @@ class CoachDecision(BaseModel):
         default_factory=dict,
         description=(
             "Action-specific parameters. Required keys per action: "
-            "call_agent={agent_name, task}, call_tool={tool_name, task}, "
-            "ask_user={prompt}, write_memory={partition, data}, "
-            "compose_response={text}."
+            "call_agent={agent_name, task}, ask_user={prompt}, "
+            "write_memory={partition, data}, compose_response={text}."
         ),
         json_schema_extra={
             "properties": {
                 "agent_name": {"type": "string"},
-                "tool_name": {"type": "string"},
                 "task": {"type": "string"},
                 "prompt": {"type": "string"},
                 "partition": {"type": "string"},
@@ -110,6 +110,9 @@ class CoachDecision(BaseModel):
 # ---------------------------------------------------------------------------
 # Medical Assessment Agent
 # ---------------------------------------------------------------------------
+# Medical has exactly one optional tool (WebSearchTool) and is otherwise
+# driven by deterministic Python (``nutrition_formulas.full_assessment``),
+# so ``tool_name`` is unnecessary in the decision schema.
 MedicalActionType = Literal["call_tool", "ask_user", "assessment_complete"]
 
 
@@ -136,8 +139,9 @@ class MedicalAssessmentDecision(BaseModel):
     assessment_plan: List[ResponseStep] = Field(default_factory=list)
 
     action_type: MedicalActionType
-    # action-specific fields (kept flat — see CoachDecision rationale)
-    tool_name: Optional[str] = None
+    # WebSearchTool is the only tool Medical can invoke; the agent fills in
+    # the tool name itself when dispatching, so the schema only carries the
+    # research question.
     tool_task: Optional[str] = None
     fields: List[str] = Field(default_factory=list)  # for ask_user
     result: Optional[MedicalAssessmentResult] = None  # for assessment_complete
@@ -147,16 +151,15 @@ class MedicalAssessmentDecision(BaseModel):
     def _infer_action_type(cls, data: Any) -> Any:
         """Derive ``action_type`` from the populated discriminator fields.
 
-        Constrained decoding will sometimes emit ``tool_name``/``tool_task``
-        or ``result`` without the matching ``action_type`` discriminator;
-        infer it from whatever the model did populate so the dispatch logic
-        stays simple.
+        Constrained decoding will sometimes emit ``tool_task`` or ``result``
+        without the matching ``action_type`` discriminator; infer it from
+        whatever the model did populate so the dispatch logic stays simple.
         """
         if not isinstance(data, dict) or data.get("action_type"):
             return data
         if data.get("result"):
             data["action_type"] = "assessment_complete"
-        elif data.get("tool_name") or data.get("tool_task"):
+        elif data.get("tool_task"):
             data["action_type"] = "call_tool"
         elif data.get("fields"):
             data["action_type"] = "ask_user"
@@ -167,6 +170,10 @@ class MedicalAssessmentDecision(BaseModel):
 # Planner Agent
 # ---------------------------------------------------------------------------
 PlannerActionType = Literal["call_tool", "draft_plan", "provide_plan"]
+
+# Planner has two tools; the schema enforces the choice at parse time so
+# the agent's dispatch can't be tricked into calling something else.
+PlannerToolName = Literal["WebSearchTool", "QuantitiesFinder"]
 
 
 class FoodItem(BaseModel):
@@ -197,10 +204,10 @@ _PLAN_SCHEMA_HINT = {
     "properties": {
         # Gemini's ``response_schema`` requires ``items`` on every array
         # and explicit ``properties`` on every nested object — without
-        # them, constrained decoding emits ``days: [{}]``. The Validator
-        # walks ``days`` recursively, so the flat-food list documented
-        # here is interchangeable with the nested ``List[List[FoodItem]]``
-        # form defined by :class:`FinalPlan`.
+        # them, constrained decoding emits ``days: [{}]``. The Planner's
+        # internal check_plan walks ``days`` recursively, so the flat-food
+        # list documented here is interchangeable with the nested
+        # ``List[List[FoodItem]]`` form defined by :class:`FinalPlan`.
         "days": {
             "type": "array",
             "items": {
@@ -246,7 +253,7 @@ class PlannerDecision(BaseModel):
     planning_steps: List[ResponseStep] = Field(default_factory=list)
 
     action_type: PlannerActionType
-    tool_name: Optional[str] = None
+    tool_name: Optional[PlannerToolName] = None
     tool_task: Optional[str] = None
     drafted_plan: Optional[Dict[str, Any]] = Field(
         default=None,
@@ -287,26 +294,6 @@ class PlannerDecision(BaseModel):
         return data
 
 
-# ---------------------------------------------------------------------------
-# Validation Agent
-# ---------------------------------------------------------------------------
-ValidationVerdict = Literal["pass", "revise", "reject"]
-ValidationSeverity = Literal["low", "medium", "high"]
-
-
-class ValidationIssue(BaseModel):
-    code: str = Field(description="Stable error code, e.g. 'allergy_violation'.")
-    description: str
-    severity: ValidationSeverity = "medium"
-
-
-class ValidationDecision(BaseModel):
-    verdict: ValidationVerdict
-    issues: List[ValidationIssue] = Field(default_factory=list)
-    notes: str = ""
-    requires_human_review: bool = False
-
-
 __all__ = [
     "Calculations",
     "CoachActionType",
@@ -319,10 +306,7 @@ __all__ = [
     "MedicalAssessmentResult",
     "PlannerActionType",
     "PlannerDecision",
+    "PlannerToolName",
     "ResponseStep",
     "StepStatus",
-    "ValidationDecision",
-    "ValidationIssue",
-    "ValidationSeverity",
-    "ValidationVerdict",
 ]

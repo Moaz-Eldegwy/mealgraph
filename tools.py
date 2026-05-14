@@ -1,31 +1,30 @@
 """Tool implementations used by the agents.
 
+Two tools, both safe by construction:
+
 * :class:`QuantitiesFinder` — PuLP linear-program solver. Given a list of
   candidate foods (with per-100g macros and an ``estimated_g`` anchor) and
   the daily targets, it returns gram quantities that minimise the weighted
   deviation from both the daily macro targets and the per-item anchors.
   Optional ``meal_constraints`` express per-meal macro caps / floors.
 
-* :class:`ComputationTool` — deterministic clinical formulas
-  (Mifflin-St Jeor BMR, ACSM activity multipliers, goal-driven calorie /
-  macro split). Accepts a structured ``{"op": ..., ...}`` task or a
-  free-form sentence with labelled numbers. The free-form fallback uses an
-  AST-restricted math evaluator for arbitrary numeric expressions; there is
-  no subprocess, no ``eval``, and no filesystem or network access.
+* :class:`WebSearchTool` — single-pass wrapper around Gemini's built-in
+  ``google_search`` grounding. Gemini decides the queries, runs them,
+  synthesises a cited answer, and returns ``grounding_metadata`` in one
+  round-trip. Citations are appended to the answer string so downstream
+  code can persist them with the plan.
 
-* :class:`WebSearchTool` — thin wrapper around Gemini's built-in
-  ``google_search`` grounding. Gemini generates queries, runs them, and
-  synthesises a cited answer in a single round-trip.
+No LLM-generated code path exists anywhere in this module: clinical math
+runs through :mod:`nutrition_formulas` (called directly by the agents) and
+``QuantitiesFinder`` is a pure LP. There is no ``eval``, no subprocess,
+and no filesystem or network access beyond the Gemini SDK.
 """
 
 from __future__ import annotations
 
-import ast
 import json
-import operator as op
-import re
 from datetime import datetime
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Dict, List
 
 from pulp import (
     LpMinimize,
@@ -38,18 +37,9 @@ from pulp import (
 )
 
 from logging_setup import get_logger
-from nutrition_formulas import (
-    bmi,
-    bmr_mifflin_st_jeor,
-    daily_calorie_target,
-    full_assessment,
-    macro_split,
-    tdee,
-)
 from utils import save_to_json
 
 _qf_logger = get_logger("tools.quantities_finder")
-_comp_logger = get_logger("tools.computation")
 _web_logger = get_logger("tools.web_search")
 
 
@@ -59,18 +49,61 @@ _web_logger = get_logger("tools.web_search")
 class QuantitiesFinder:
     """Linear-program solver that turns an LLM-drafted plan into precise grams.
 
-    The schema is:
+    Input schema (tool_task must be a JSON string):
 
         {
-            "foods": [{name, calories, protein, fat, carbohydrates,
-                       estimated_g, [min_g, max_g, meal_group, estimate_weight]}, ...],
-            "targets": {calories, protein, fat, carbohydrates},
-            "meal_constraints": [{group_name, [max_<nut>], [min_<nut>]}, ...]   # optional
+            "foods": [
+                {
+                    "name": str,
+                    "calories": float,        # per 100g
+                    "protein": float,         # per 100g
+                    "fat": float,             # per 100g
+                    "carbohydrates": float,   # per 100g
+                    "estimated_g": float,     # LLM's anchor weight
+                    # optional:
+                    "min_g": float,
+                    "max_g": float,
+                    "meal_group": str,
+                    "estimate_weight": float,
+                },
+                ...
+            ],
+            "targets": {
+                "calories": float,
+                "protein": float,
+                "fat": float,
+                "carbohydrates": float,
+            },
+            "meal_constraints": [   # optional
+                {"group_name": str, "max_<nut>": float, "min_<nut>": float},
+                ...
+            ]
         }
+
+    Default per-food bounds (when ``min_g``/``max_g`` are not supplied)::
+
+        min_g = max(20,  estimated_g * 0.3)
+        max_g = min(400, estimated_g * 2.5)
+
+    These stop the LP from suggesting 1 g of butter or 900 g of broccoli
+    to chase a macro target. The estimate-anchor weight defaults to 0.3
+    (was 0.1 in earlier revisions) so the LP must have a strong reason to
+    drift away from the LLM's drafted serving sizes — small deviations are
+    penalised harder, which keeps the output realistic.
     """
 
     def __init__(self) -> None:
         pass
+
+    # Priority 1: hit daily totals; Priority 2: stay close to per-item
+    # estimates. The default estimate weight is intentionally non-trivial
+    # so the LP cannot wander far from the LLM's draft.
+    W_NUTRITION = 1.0
+    W_ESTIMATE_DEFAULT = 0.3
+    MIN_BOUND_FLOOR = 20.0
+    MAX_BOUND_CAP = 400.0
+    MIN_BOUND_RATIO = 0.3
+    MAX_BOUND_RATIO = 2.5
 
     @staticmethod
     def _round(v: Any) -> float:
@@ -88,11 +121,20 @@ class QuantitiesFinder:
             return QuantitiesFinder._round(obj)
         return obj
 
+    @classmethod
+    def _default_bounds(cls, est_g: float) -> tuple[float, float]:
+        """Default ``(min_g, max_g)`` derived from ``estimated_g``."""
+        if est_g <= 0:
+            return cls.MIN_BOUND_FLOOR, cls.MAX_BOUND_CAP
+        min_g = max(cls.MIN_BOUND_FLOOR, est_g * cls.MIN_BOUND_RATIO)
+        max_g = min(cls.MAX_BOUND_CAP, est_g * cls.MAX_BOUND_RATIO)
+        if min_g > max_g:
+            # Degenerate case: bounds collide. Fall back to the est anchor.
+            min_g, max_g = max(0.0, est_g - 1), est_g + 1
+        return min_g, max_g
+
     def handle_task(self, task: str) -> str:
         _qf_logger.info("\n📊 QUANTITIES FINDER TOOL STARTED")
-        # Priority 1: hit daily totals; Priority 2: stay close to per-item estimates.
-        W_NUTRITION = 1.0
-        W_ESTIMATE_DEFAULT = 0.1
 
         try:
             data = json.loads(task)
@@ -102,33 +144,48 @@ class QuantitiesFinder:
             # 1. Validation
             required_nutrients = ["calories", "protein", "fat", "carbohydrates"]
             for food in foods:
-                if not all(key in food for key in ["name"] + required_nutrients + ["estimated_g"]):
+                if not all(
+                    key in food for key in ["name"] + required_nutrients + ["estimated_g"]
+                ):
                     raise ValueError(
-                        "Each food must have name, calories, protein, fat, carbohydrates, and estimated_g."
+                        "Each food must have name, calories, protein, fat, "
+                        "carbohydrates, and estimated_g."
                     )
             if not all(key in targets for key in required_nutrients):
-                raise ValueError("Targets must include calories, protein, fat, carbohydrates.")
+                raise ValueError(
+                    "Targets must include calories, protein, fat, carbohydrates."
+                )
 
             prob = LpProblem("Nutrient_Optimization", LpMinimize)
 
-            # 2. Variables
-            g = {}
+            # 2. Variables (with realistic default bounds)
+            g: Dict[str, LpVariable] = {}
             for food in foods:
+                est = float(food["estimated_g"])
+                default_min, default_max = self._default_bounds(est)
+                min_g = float(food.get("min_g", default_min))
+                max_g = float(food.get("max_g", default_max))
                 g[food["name"]] = LpVariable(
                     f"g_{food['name']}",
-                    lowBound=food.get("min_g", 0),
-                    upBound=food.get("max_g"),
+                    lowBound=min_g,
+                    upBound=max_g,
                 )
 
-            # 3. Nutrition deviations
+            # 3. Nutrition deviations.
+            # ``g[name] * (per100 / 100)`` keeps the LpVariable on the LEFT of
+            # the multiplication so PuLP returns an LpAffineExpression. The
+            # earlier ``g[name] / 100 * per100`` form trips Python's operator
+            # precedence: ``g / 100`` raises ``LpVariable / int`` which is
+            # rejected by PuLP at expression-build time.
             totals = {
-                nut: lpSum((g[f["name"]] / 100) * f[nut] for f in foods) for nut in required_nutrients
+                nut: lpSum(g[f["name"]] * (float(f[nut]) / 100.0) for f in foods)
+                for nut in required_nutrients
             }
             d_pos = {nut: LpVariable(f"d_pos_{nut}", lowBound=0) for nut in required_nutrients}
             d_neg = {nut: LpVariable(f"d_neg_{nut}", lowBound=0) for nut in required_nutrients}
             for nut in required_nutrients:
-                prob += totals[nut] - targets[nut] <= d_pos[nut]
-                prob += targets[nut] - totals[nut] <= d_neg[nut]
+                prob += totals[nut] - float(targets[nut]) <= d_pos[nut]
+                prob += float(targets[nut]) - totals[nut] <= d_neg[nut]
 
             # 3.5 Optional meal-level constraints
             for constraint in data.get("meal_constraints", []) or []:
@@ -140,46 +197,50 @@ class QuantitiesFinder:
                     _qf_logger.warning("No foods found for meal_group '%s'", group_name)
                     continue
                 for nut in required_nutrients:
-                    meal_total = lpSum((g[f["name"]] / 100) * f[nut] for f in group_foods)
+                    meal_total = lpSum(
+                        g[f["name"]] * (float(f[nut]) / 100.0) for f in group_foods
+                    )
                     if (max_val := constraint.get(f"max_{nut}")) is not None:
                         prob += (meal_total <= max_val, f"Meal_{group_name}_max_{nut}")
-                        _qf_logger.debug("Constraint: %s max %s <= %s", group_name, nut, max_val)
                     if (min_val := constraint.get(f"min_{nut}")) is not None:
                         prob += (meal_total >= min_val, f"Meal_{group_name}_min_{nut}")
-                        _qf_logger.debug("Constraint: %s min %s >= %s", group_name, nut, min_val)
 
             # 4. Estimate deviations (per-item soft anchor)
             dev_est_pos = {f["name"]: LpVariable(f"dev_est_pos_{f['name']}", lowBound=0) for f in foods}
             dev_est_neg = {f["name"]: LpVariable(f"dev_est_neg_{f['name']}", lowBound=0) for f in foods}
             for food in foods:
                 name = food["name"]
-                est = food["estimated_g"]
+                est = float(food["estimated_g"])
                 prob += g[name] - est <= dev_est_pos[name]
                 prob += est - g[name] <= dev_est_neg[name]
 
             # 5. Objective
             nutrition_objective = lpSum(
-                (d_pos[nut] + d_neg[nut]) / max(targets[nut], 1) for nut in required_nutrients
+                (d_pos[nut] + d_neg[nut]) / max(float(targets[nut]), 1.0)
+                for nut in required_nutrients
             )
             estimate_objective = lpSum(
-                f.get("estimate_weight", W_ESTIMATE_DEFAULT)
+                float(f.get("estimate_weight", self.W_ESTIMATE_DEFAULT))
                 * (dev_est_pos[f["name"]] + dev_est_neg[f["name"]])
-                / max(f["estimated_g"], 1)
+                / max(float(f["estimated_g"]), 1.0)
                 for f in foods
-                if f["estimated_g"] > 0
+                if float(f["estimated_g"]) > 0
             )
-            prob += (W_NUTRITION * nutrition_objective) + estimate_objective
+            prob += (self.W_NUTRITION * nutrition_objective) + estimate_objective
 
             # 6. Solve
             prob.solve(PULP_CBC_CMD(msg=0))
             if LpStatus[prob.status] != "Optimal":
                 raise ValueError(
-                    "No optimal solution found (problem may be infeasible). Check your targets and constraints."
+                    "No optimal solution found (problem may be infeasible). "
+                    "Check your targets and constraints."
                 )
 
             quantities = {name: value(g[name]) for name in g}
             achieved = {nut: value(totals[nut]) for nut in required_nutrients}
-            result = QuantitiesFinder._round_structure({"quantities": quantities, "achieved": achieved})
+            result = QuantitiesFinder._round_structure(
+                {"quantities": quantities, "achieved": achieved}
+            )
 
             _qf_logger.info("Solution Status: %s", LpStatus[prob.status])
             _qf_logger.info("Quantities (g): %s", json.dumps(result["quantities"], indent=2))
@@ -200,319 +261,6 @@ class QuantitiesFinder:
 
 
 # ---------------------------------------------------------------------------
-# ComputationTool (deterministic + sandboxed; no subprocess/eval/exec)
-# ---------------------------------------------------------------------------
-_OP_MAP: Dict[str, Callable[[str], str]]
-
-
-class ComputationTool:
-    """Deterministic numerical helpers for the agent system.
-
-    Accepts either:
-
-    1. A structured JSON task: ``{"op": "<name>", ...args}``. Supported ops:
-       ``bmi``, ``bmr``, ``tdee``, ``calorie_target``, ``macro_split``,
-       ``full_assessment``, ``eval`` (sandboxed math expression).
-    2. A free-form English task (legacy). The tool's regex parser tries to
-       extract numeric arguments and dispatch to the right formula. If
-       parsing is ambiguous, the tool returns a structured error asking the
-       agent to retry with the JSON form — no LLM-generated code, no
-       subprocess.
-    """
-
-    # Activity / sex / goal lexicon used by the free-form parser.
-    _SEX_PATTERN = re.compile(r"\b(male|female)\b", re.I)
-    _ACTIVITY_PATTERN = re.compile(
-        r"\b(sedentary|lightly active|moderately active|very active|extra active)\b",
-        re.I,
-    )
-    _GOAL_PATTERN = re.compile(
-        r"\b(lose weight|maintain weight|gain muscle|gain weight)\b", re.I
-    )
-
-    def __init__(self, llm_instance: Optional[Any] = None) -> None:
-        # llm_instance retained only for backwards-compat constructor signature;
-        # this tool no longer calls the LLM.
-        self.llm = llm_instance
-
-    # ------------------------------------------------------------------
-    def handle_task(self, task_description: str) -> str:
-        _comp_logger.info("\n🤖 COMPUTATION TOOL STARTED (deterministic)")
-        try:
-            result = self._dispatch(task_description)
-        except Exception as e:  # noqa: BLE001
-            result = {"error": f"{type(e).__name__}: {e}"}
-
-        result_json = json.dumps(result)
-        save_to_json(
-            {
-                "input": task_description,
-                "result": result,
-                "timestamp": datetime.now().isoformat(),
-            },
-            f"computation_tool_{datetime.now().isoformat()}.json",
-            subdirectory="ComputationTool",
-        )
-        _comp_logger.info("🤖 COMPUTATION COMPLETED %s", result_json)
-        return result_json
-
-    # ------------------------------------------------------------------
-    def _dispatch(self, task: str) -> Dict[str, Any]:
-        # 1. Structured JSON dispatch
-        try:
-            data = json.loads(task)
-            if isinstance(data, dict) and "op" in data:
-                return self._run_op(data)
-        except (json.JSONDecodeError, TypeError):
-            pass
-
-        # 2. Free-form English -> formula
-        return self._parse_free_form(task)
-
-    def _run_op(self, data: Dict[str, Any]) -> Dict[str, Any]:
-        op_name = str(data.get("op", "")).lower()
-        if op_name == "bmi":
-            return {"BMI": round(bmi(float(data["weight_kg"]), float(data["height_cm"])), 2)}
-        if op_name == "bmr":
-            return {
-                "BMR": round(
-                    bmr_mifflin_st_jeor(
-                        float(data["weight_kg"]),
-                        float(data["height_cm"]),
-                        float(data["age_years"]),
-                        str(data["sex"]),
-                    ),
-                    1,
-                )
-            }
-        if op_name == "tdee":
-            return {"TDEE": round(tdee(float(data["bmr"]), str(data["activity_level"])), 1)}
-        if op_name == "calorie_target":
-            return {
-                "daily_target_calories": daily_calorie_target(
-                    float(data["tdee"]), str(data["goal"])
-                )
-            }
-        if op_name == "macro_split":
-            return {
-                "macro_targets": macro_split(
-                    int(data["daily_target_calories"]),
-                    str(data["goal"]),
-                    weight_kg=float(data["weight_kg"]) if "weight_kg" in data else None,
-                )
-            }
-        if op_name == "full_assessment":
-            return full_assessment(
-                weight_kg=float(data["weight_kg"]),
-                height_cm=float(data["height_cm"]),
-                age_years=float(data["age_years"]),
-                sex=str(data["sex"]),
-                activity_level=str(data["activity_level"]),
-                goal=str(data["goal"]),
-            )
-        if op_name == "eval":
-            return {"result": safe_math_eval(str(data["expression"]))}
-        raise ValueError(
-            f"Unknown op {op_name!r}. Valid: bmi, bmr, tdee, calorie_target, "
-            "macro_split, full_assessment, eval."
-        )
-
-    # ------------------------------------------------------------------
-    def _parse_free_form(self, task: str) -> Dict[str, Any]:
-        """Extract numeric kwargs from a free-form sentence and dispatch."""
-        t = task.lower()
-        nums = _extract_numbers(task)
-
-        sex_m = self._SEX_PATTERN.search(task)
-        activity_m = self._ACTIVITY_PATTERN.search(task)
-        goal_m = self._GOAL_PATTERN.search(task)
-
-        sex = sex_m.group(1).lower() if sex_m else None
-        activity = activity_m.group(1).lower() if activity_m else None
-        goal = goal_m.group(1).lower() if goal_m else None
-
-        # Heuristic intent detection.
-        wants_full = any(
-            k in t for k in ("bmi", "bmr", "tdee", "calorie", "macro", "assessment")
-        ) and {"weight_kg", "height_cm", "age"}.issubset(_label_numbers(task, nums).keys())
-
-        labelled = _label_numbers(task, nums)
-
-        if wants_full and sex and activity and goal:
-            return full_assessment(
-                weight_kg=labelled["weight_kg"],
-                height_cm=labelled["height_cm"],
-                age_years=labelled["age"],
-                sex=sex,
-                activity_level=activity,
-                goal=goal,
-            )
-
-        # Compose a partial assessment from whichever pieces we can derive.
-        # Each piece short-circuits gracefully so the caller gets back as much
-        # as the task supports — much friendlier than the all-or-nothing error.
-        partial: Dict[str, Any] = {}
-        have_anthropo = {"weight_kg", "height_cm", "age"}.issubset(labelled)
-
-        if "bmi" in t and {"weight_kg", "height_cm"}.issubset(labelled):
-            partial["BMI"] = round(bmi(labelled["weight_kg"], labelled["height_cm"]), 2)
-
-        bmr_value: float | None = None
-        if ("bmr" in t or "mifflin" in t) and have_anthropo and sex:
-            bmr_value = bmr_mifflin_st_jeor(
-                labelled["weight_kg"], labelled["height_cm"], labelled["age"], sex
-            )
-            partial["BMR"] = round(bmr_value, 1)
-
-        tdee_value: float | None = None
-        if "tdee" in t and activity:
-            base_bmr = bmr_value
-            if base_bmr is None and have_anthropo and sex:
-                base_bmr = bmr_mifflin_st_jeor(
-                    labelled["weight_kg"], labelled["height_cm"], labelled["age"], sex
-                )
-            if base_bmr is not None:
-                tdee_value = tdee(base_bmr, activity)
-                partial["TDEE"] = round(tdee_value, 1)
-
-        if ("calorie" in t or "kcal" in t or "target" in t) and goal:
-            base_tdee = tdee_value
-            if base_tdee is None and have_anthropo and sex and activity:
-                base_tdee = tdee(
-                    bmr_mifflin_st_jeor(
-                        labelled["weight_kg"], labelled["height_cm"], labelled["age"], sex
-                    ),
-                    activity,
-                )
-            if base_tdee is not None:
-                partial["daily_target_calories"] = daily_calorie_target(base_tdee, goal)
-
-        if "macro" in t and "daily_target_calories" in partial:
-            partial["macro_targets"] = macro_split(
-                partial["daily_target_calories"],
-                goal,
-                weight_kg=labelled.get("weight_kg"),
-            )
-
-        if partial:
-            return partial
-
-        # Pure arithmetic fallback ("compute 2700 * 0.30 / 4")
-        candidate = _strip_to_expression(task)
-        if candidate and re.fullmatch(r"[\d\.\s\+\-\*\/\(\)]+", candidate):
-            return {"result": safe_math_eval(candidate)}
-
-        return {
-            "error": (
-                "ComputationTool could not parse the task. Re-issue using JSON: "
-                '{"op": "full_assessment", "weight_kg": ..., "height_cm": ..., '
-                '"age_years": ..., "sex": "male"|"female", '
-                '"activity_level": "sedentary"|..., "goal": "lose weight"|...}'
-            ),
-            "received": task,
-        }
-
-
-# ---------------------------------------------------------------------------
-# Safe math evaluator (no names, no calls, no attribute access)
-# ---------------------------------------------------------------------------
-_SAFE_BIN_OPS = {
-    ast.Add: op.add,
-    ast.Sub: op.sub,
-    ast.Mult: op.mul,
-    ast.Div: op.truediv,
-    ast.FloorDiv: op.floordiv,
-    ast.Mod: op.mod,
-    ast.Pow: op.pow,
-}
-_SAFE_UNARY_OPS = {ast.UAdd: op.pos, ast.USub: op.neg}
-
-
-def safe_math_eval(expression: str) -> float:
-    """Evaluate ``expression`` using a strict AST whitelist.
-
-    Allowed: numeric literals, the seven arithmetic binary operators above,
-    unary +/-, and parentheses. Anything else (names, calls, attribute access,
-    subscripts, comprehensions, comparisons, lambdas, ...) raises ``ValueError``.
-    """
-    if len(expression) > 200:
-        raise ValueError("expression too long")
-    tree = ast.parse(expression, mode="eval")
-
-    def _eval(node: ast.AST) -> float:
-        if isinstance(node, ast.Expression):
-            return _eval(node.body)
-        if isinstance(node, ast.Constant):
-            if isinstance(node.value, (int, float)):
-                return float(node.value)
-            raise ValueError(f"Forbidden constant: {node.value!r}")
-        if isinstance(node, ast.BinOp) and type(node.op) in _SAFE_BIN_OPS:
-            return _SAFE_BIN_OPS[type(node.op)](_eval(node.left), _eval(node.right))
-        if isinstance(node, ast.UnaryOp) and type(node.op) in _SAFE_UNARY_OPS:
-            return _SAFE_UNARY_OPS[type(node.op)](_eval(node.operand))
-        raise ValueError(f"Forbidden expression node: {type(node).__name__}")
-
-    return float(_eval(tree))
-
-
-# ---------------------------------------------------------------------------
-# Free-form parser helpers
-# ---------------------------------------------------------------------------
-_NUMBER_RE = re.compile(r"-?\d+(?:\.\d+)?")
-
-
-def _extract_numbers(text: str) -> list[float]:
-    return [float(m) for m in _NUMBER_RE.findall(text)]
-
-
-_UNIT_AFTER_RE = re.compile(
-    # Require the unit to be terminated by non-word, non-slash (or EOS), so
-    # rate phrases like ``0.5kg/week`` and lab values like ``mg/dL`` no longer
-    # collapse into ``weight_kg``/``height_cm`` labels.
-    r"\s*(kg|cm|years|year|yrs|yr|yo|y/o)(?=[^\w/]|$)",
-    re.IGNORECASE,
-)
-
-
-def _label_numbers(text: str, nums: list[float]) -> Dict[str, float]:
-    """Associate numbers with role labels via the unit *immediately* after
-    each number.
-
-    The anchor matters: a wider window over-collects, so ``"165cm and 78kg"``
-    would otherwise also see ``kg`` for ``165``. The unit regex requires a
-    non-word, non-slash terminator (or end-of-string) so rate phrases like
-    ``"0.5kg/week"`` and lab values like ``"110 mg/dL"`` do not poison the
-    label set.
-    """
-    labelled: Dict[str, float] = {}
-    for m in _NUMBER_RE.finditer(text):
-        n = float(m.group(0))
-        unit_match = _UNIT_AFTER_RE.match(text, m.end())
-        head = text[max(0, m.start() - 25) : m.start()].lower()
-
-        unit = unit_match.group(1).lower() if unit_match else ""
-        if unit == "kg" and "weight_kg" not in labelled:
-            labelled["weight_kg"] = n
-        elif unit == "cm" and "height_cm" not in labelled:
-            labelled["height_cm"] = n
-        elif unit in {"year", "years", "yr", "yrs", "yo", "y/o"} and "age" not in labelled:
-            labelled["age"] = n
-        elif unit == "" and "age" in head and "age" not in labelled:
-            # Catches ``age 34`` / ``aged 34`` / ``age: 34``.
-            labelled["age"] = n
-    return labelled
-
-
-def _strip_to_expression(text: str) -> str | None:
-    """Pull out an obvious arithmetic substring like '2700 * 0.30 / 4'."""
-    m = re.search(r"[\d\.\(\)\+\-\*\/\s]{4,}", text)
-    if not m:
-        return None
-    candidate = m.group(0).strip()
-    return candidate if any(c in candidate for c in "+-*/") else None
-
-
-# ---------------------------------------------------------------------------
 # WebSearchTool (Gemini google_search grounding)
 # ---------------------------------------------------------------------------
 class WebSearchTool:
@@ -526,17 +274,17 @@ class WebSearchTool:
 
     The injected ``llm_instance`` must expose
     :meth:`utils.GeminiLLM.call_grounded`. In tests, the ``MockLLM`` fixture
-    provides the same surface.
+    can stub the same surface.
     """
 
     _SYSTEM_INSTRUCTION = (
         "You are a nutrition / clinical research assistant. Answer the "
         "question below using up-to-date sources you can find via Google "
         "Search. Prefer authoritative domains (WHO, USDA / FDC, EFSA, NICE, "
-        "ADA, NIH, peer-reviewed journals, government health agencies). "
-        "Return a concise, factual answer; cite source URLs inline. "
-        "If the question asks for nutrition facts, give per-100g values for "
-        "calories, protein, fat, and carbohydrates when available."
+        "ADA, NIH, MedlinePlus, peer-reviewed journals, government health "
+        "agencies). Return a concise, factual answer; cite source URLs "
+        "inline. If the question asks for nutrition facts, give per-100g "
+        "values for calories, protein, fat, and carbohydrates when available."
     )
 
     def __init__(self, llm_instance: Any) -> None:
@@ -597,12 +345,11 @@ class WebSearchTool:
         return task
 
     @staticmethod
-    def _append_sources(text: str, citations: list[Dict[str, str]]) -> str:
+    def _append_sources(text: str, citations: List[Dict[str, str]]) -> str:
         if not citations:
             return text
-        # Skip duplicates while preserving order.
         seen: set[str] = set()
-        lines: list[str] = []
+        lines: List[str] = []
         for c in citations:
             uri = c.get("uri", "")
             if not uri or uri in seen:
@@ -615,3 +362,4 @@ class WebSearchTool:
         return f"{text}\n\nSources:\n" + "\n".join(lines)
 
 
+__all__ = ["QuantitiesFinder", "WebSearchTool"]

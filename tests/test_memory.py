@@ -80,36 +80,8 @@ def test_recall_limit_and_order() -> None:
     assert facts[0]["content"] == "fact-14"
 
 
-def test_knowledge_agent_returns_citations() -> None:
-    """KnowledgeAgent should always return a citations list (possibly empty)."""
-    from knowledge import KnowledgeAgent
-
-    class StubWebSearch:
-        def handle_task(self, query: str) -> str:
-            return (
-                "Calories per 100g of chicken breast: 165 kcal (USDA FDC).\n"
-                "Source: https://fdc.nal.usda.gov/food-details/171477/nutrients"
-            )
-
-    agent = KnowledgeAgent(StubWebSearch())
-    import json
-    raw = agent.handle_task('{"kind": "nutrition", "query": "chicken breast"}', memory={})
-    payload = json.loads(raw)
-    assert payload["kind"] == "nutrition"
-    assert payload["citations"], "Should extract at least one URL"
-    assert any("fdc.nal.usda.gov" in c for c in payload["citations"])
-
-
-def test_knowledge_agent_marks_uncited_answers() -> None:
-    """When no citations are found, agent appends an advisory note."""
-    from knowledge import KnowledgeAgent
-    import json
-
-    class NoCitationStub:
-        def handle_task(self, query: str) -> str:
-            return "Generic answer without any URL."
-
-    agent = KnowledgeAgent(NoCitationStub())
-    payload = json.loads(agent.handle_task("how many calories in an apple?", memory={}))
-    assert payload["citations"] == []
-    assert "advisory only" in payload["answer"]
+# NOTE: The KnowledgeAgent tests previously here have been removed.
+# KnowledgeAgent itself was removed; citation-first retrieval now happens
+# inside :class:`tools.WebSearchTool`, which returns citations natively
+# from Gemini's ``grounding_metadata``. Its coverage lives in the live
+# Gemini audit rather than the offline test suite.

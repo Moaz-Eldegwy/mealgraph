@@ -13,14 +13,17 @@ from agent_cards import (
 
 
 def test_default_cards_cover_every_agent() -> None:
+    """The 3-agent topology: Coach + Medical + Planner. No ValidationAgent
+    or KnowledgeAgent any more — the Validator's deterministic checks moved
+    into the Planner (post-LP ``check_plan``), the LLM-graded layer moved
+    into the Coach's self-review, and citation-first retrieval now lives
+    inside ``WebSearchTool``'s grounded search."""
     names = {c.name for c in default_cards()}
-    assert {
+    assert names == {
         "CoachAgent",
         "MedicalAssessmentAgent",
         "PlannerAgent",
-        "ValidationAgent",
-        "KnowledgeAgent",
-    } <= names
+    }
 
 
 def test_registry_register_and_get() -> None:

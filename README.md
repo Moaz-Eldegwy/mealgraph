@@ -15,28 +15,33 @@ short_description: Multi-agent nutrition planner with LangGraph + Gemini
 A clinical-nutrition planner built on **LangGraph** and **Gemini 3.x**
 (`gemini-pro-latest` · `gemini-flash-latest` · `gemini-flash-lite-latest`).
 
-A `CoachAgent` orchestrates four specialists — `MedicalAssessmentAgent`,
-`PlannerAgent`, `ValidationAgent`, and `KnowledgeAgent` — and routes
-between them based on a typed action plan. The Planner uses a **PuLP
-linear-program solver** to translate LLM-drafted meals into exact gram
-quantities; the Validator runs both deterministic checks (allergy
-violations, calorie / macro tolerances) and an LLM-graded clinical pass
-(medical-flag respect, citations, cultural fit) before any plan reaches
-the user.
+Three agents — **Coach**, **MedicalAssessmentAgent**, and
+**PlannerAgent** — sit on top of two safe-by-construction tools (a PuLP
+linear-program meal solver and a Gemini-grounded web search). Clinical
+math runs through closed-form Python formulas (Mifflin-St Jeor BMR,
+ACSM activity multipliers); the LLM interprets the numbers but never
+recomputes them. The Planner runs a deterministic plan check after the
+LP solver and self-revises on allergy / calorie / macro violations
+before returning. The Coach does an LLM-graded self-review (medical
+flag respect, citation presence, cultural fit) before composing.
 
 ```
                 ┌───────────────────────────────────────────┐
                 │                  Coach                    │
                 │  one typed action per turn (LangGraph)    │
+                │  + self-review of the Planner's output    │
                 └──────────────┬────────────────────────────┘
-                               │ call_agent / call_tool / ask_user
+                               │ call_agent / ask_user
                                │ write_memory / compose_response
-       ┌───────────────┬───────┴────────┬───────────────┬───────────────┐
-       ▼               ▼                ▼               ▼               ▼
-  Medical          Planner          Validation      Knowledge        Tools
-  Assessment      (PuLP LP)        (critic loop)   (citations)    Compute /
-                                                                  WebSearch /
-                                                                  Quantities
+                ┌──────────────┴──────────────┐
+                ▼                             ▼
+       MedicalAssessment                  Planner
+       deterministic math                draft -> LP -> check_plan
+       + LLM enrichment                  (≤ 2 internal revisions)
+                │                             │
+                ▼                             ▼
+         nutrition_formulas        QuantitiesFinder (PuLP)
+         (BMI / BMR / TDEE)        WebSearchTool (grounded)
 ```
 
 ## Quick start
@@ -57,20 +62,18 @@ auto-detected entry point.
 
 | Component | Role | Key file |
 |---|---|---|
-| **CoachAgent** | Orchestrator. Picks one action per turn (`call_agent` / `call_tool` / `ask_user` / `write_memory` / `compose_response`). | `agents.py` |
-| **MedicalAssessmentAgent** | BMI / BMR / TDEE / macros, clinical flags, evidence sources. | `agents.py` |
-| **PlannerAgent** | Drafts meals; runs `QuantitiesFinder` LP for exact grams. | `agents.py` |
-| **ValidationAgent** | Generator-critic gate. Deterministic allergy / calorie / macro checks + LLM-graded medical-flag respect and citation requirement. | `validation.py` |
-| **KnowledgeAgent** | Citation-first lookup, biased toward authoritative domains (USDA / WHO / ADA / EFSA / NICE). | `knowledge.py` |
-| **QuantitiesFinder** | PuLP linear-program meal-quantity solver. Deterministic. | `tools.py` |
-| **ComputationTool** | Closed-form clinical formulas (Mifflin-St Jeor BMR, ACSM activity multipliers). No subprocess, no `eval`. | `tools.py`, `nutrition_formulas.py` |
-| **WebSearchTool** | Single-pass Gemini call with built-in `google_search` grounding; returns answer + cited URLs. | `tools.py` |
-| **LongTermMemory** | SQLite-backed semantic / procedural / episodic tiers. | `memory.py` |
-| **Guardrails** | Prompt-injection sniff, PII redaction, HITL escalation marker. | `guardrails.py` |
-| **MCP server** | Exposes the same tools to Claude Desktop, Cursor, and any MCP-aware client. | `mcp_server.py` |
-| **Agent cards** | A2A capability descriptors with an in-process registry. | `agent_cards.py` |
-| **Observability** | LangSmith passthrough + in-process metrics surface. | `observability.py` |
-| **Eval harness** | Three fixture personas; runs offline (no Gemini calls). | `evals/` |
+| **CoachAgent** | Orchestrator. Picks one action per turn (`call_agent` / `ask_user` / `write_memory` / `compose_response`). After the Planner returns, runs an LLM-graded self-review (medical-flag respect, citation presence, cultural fit) and triggers a revision when needed. | [agents.py](agents.py) |
+| **MedicalAssessmentAgent** | Deterministic clinical math first (`full_assessment` → BMI / BMR / TDEE / macros), then an LLM step that emits flags / recommendations / evidence. The agent **overwrites** the LLM's `calculations` with the deterministic values so the math is exact by construction. | [agents.py](agents.py) |
+| **PlannerAgent** | Drafts meals, batches nutrition lookups via the grounded `WebSearchTool`, runs the `QuantitiesFinder` LP, then runs `check_plan` (allergy / calorie / macro tolerances) inline. Up to two internal revisions resolve any blocking issue before returning. | [agents.py](agents.py) |
+| **`check_plan`** | Deterministic post-LP critic. Allergy → severity `high` (hard block); calorie ±3 % / macro ±5 % → severity `medium`; disliked food → severity `low`. Same code path the Planner uses internally and the eval harness asserts against. | [agents.py](agents.py) |
+| **QuantitiesFinder** | PuLP linear-program meal-quantity solver. Default per-food bounds `min = max(20, est × 0.3)`, `max = min(400, est × 2.5)` keep the LP from suggesting 1 g of butter or 900 g of broccoli. Estimate-anchor weight is `0.3`. | [tools.py](tools.py) |
+| **WebSearchTool** | Single round-trip wrapper around Gemini's built-in `google_search` grounding. Returns answer + citations + queries from `grounding_metadata`. Prompt biases toward USDA / WHO / ADA / EFSA / NICE / FDA / MedlinePlus. | [tools.py](tools.py) |
+| **LongTermMemory** | SQLite-backed semantic / procedural / episodic tiers. | [memory.py](memory.py) |
+| **Guardrails** | Prompt-injection sniff, PII redaction, HITL escalation marker (`<<HITL:CLINICIAN_REVIEW_REQUIRED>>`). | [guardrails.py](guardrails.py) |
+| **MCP server** | Exposes `QuantitiesFinder` and `assess_user` to Claude Desktop, Cursor, and any MCP-aware client. | [mcp_server.py](mcp_server.py) |
+| **Agent cards** | A2A capability descriptors (three cards) with an in-process registry. | [agent_cards.py](agent_cards.py) |
+| **Observability** | LangSmith passthrough + in-process metrics surface. | [observability.py](observability.py) |
+| **Eval harness** | Three fixture personas; runs offline (no Gemini calls) against `check_plan`. | [evals/](evals/) |
 
 ### Models and rate limits
 
@@ -82,19 +85,20 @@ RPD limits below are conservative defaults; override with
 |---|---:|---:|---|
 | `gemini-pro-latest` | 5 | 100 | Coach, Medical, Planner |
 | `gemini-flash-latest` | 10 | 250 | Available for overrides |
-| `gemini-flash-lite-latest` | 15 | 500 | Tools, Validator, simulator |
+| `gemini-flash-lite-latest` | 15 | 500 | Tools (WebSearch), simulator |
 
-### Validator semantics
+### Safety guarantees
 
-The Validator returns one of three verdicts. The Coach reacts to each
-verdict via its system prompt; the loop is bounded so revisions cannot
-run away.
-
-| Verdict | Coach response |
+| Guarantee | Where it lives |
 |---|---|
-| `pass` | Proceed to `compose_response`. |
-| `revise` | Re-call the Planner with the issues bundled into the task. Capped at two revisions. |
-| `reject` | Refuse the request and emit a human-in-the-loop escalation marker. |
+| **Allergies never appear in the plan** | Planner's `check_plan` — severity `high` → hard block → internal revision. |
+| **Calorie target hit within ±3 %** | Planner's `check_plan` — severity `medium` → revision. |
+| **Each macro hit within ±5 %** | Planner's `check_plan` — severity `medium` → revision. |
+| **Medical flags respected** | Coach's self-review turn (LLM-graded). |
+| **Clinical claims carry citations** | `WebSearchTool` returns `grounding_chunks` natively; Coach checks for them in self-review. |
+| **Serious cases escalate** | Medical sets `requires_professional_consultation=True`; Coach appends `<<HITL:CLINICIAN_REVIEW_REQUIRED>>`. |
+| **No RCE via LLM-generated code** | No code-from-LLM path exists at all. `nutrition_formulas` is closed-form Python; `QuantitiesFinder` is a pure LP. |
+| **Deterministic math** | `full_assessment()` runs server-side; the Medical agent overwrites whatever the LLM emitted for `calculations`. |
 
 ### Run the offline eval harness
 
@@ -107,12 +111,14 @@ python -m evals.runner
 
 ### Run the test suite
 
-84 tests cover schemas, solver behaviour, safety surface, rate-limit
-pool, memory tiers, and full Coach ↔ specialist loops via a mock LLM:
-
 ```bash
 pytest -ra
 ```
+
+Coverage: schemas, solver behaviour, safety surface, rate-limit pool,
+memory tiers, and full Coach ↔ specialist loops via a mock LLM. The
+post-LP allergy revision and deterministic-calculation overwrite are
+both unit-tested.
 
 ---
 
@@ -136,7 +142,6 @@ each model's RPM / RPD limit. A single key is enough for evaluation.
 api_keys = [
     "your_api_key1",
     "your_api_key2",
-    # add more as needed
 ]
 ```
 
@@ -152,45 +157,7 @@ model_overrides = {
 }
 ```
 
-Pass `None` (or skip the argument) to use the defaults.
-
-### 4. (Optional) Toggle rate limiting
-
-Rate limiting is on by default. Disable it for local development or when
-you have paid-tier quota:
-
-```python
-mealgraph.create_llm_instances(api_keys, model_overrides, enable_rate_limiting=False)
-```
-
-### 5. (Optional) Debug mode
-
-User mode prints high-level progress:
-
-```
-Coach Agent: Calling MedicalAssessmentAgent with task 'Assess user health'
-Medical Assessment Agent: Using ComputationTool for 'Calculate BMI'
-Coach Agent: Composing final response
-```
-
-Debug mode adds raw LLM I/O:
-
-```python
-mealgraph.debug(level='full', scopes={'agents': ['CoachAgent'], 'tools': ['all']})
-```
-
-* `level`: `'full'` (inputs + outputs) or `'output'` (outputs only).
-* `scopes`: `{'agents': ['all' | <name>...], 'tools': ['all' | <name>...]}`.
-
-### 6. Persistent logging
-
-Dump every agent / tool I/O to a directory:
-
-```python
-mealgraph.logging("path/to/log/dir")
-```
-
-### 7. Initialise
+### 4. Initialise
 
 ```python
 mealgraph.create_llm_instances(api_keys, model_overrides, enable_rate_limiting=True)
@@ -199,7 +166,7 @@ mealgraph.initialize_agents()
 mealgraph.setup_workflow()
 ```
 
-### 8. Run
+### 5. Run
 
 Either interactive mode (collects user data via stdin) or simulation
 mode (drives one or more synthetic users through a fixed question list):
@@ -210,41 +177,21 @@ mealgraph.run(simulate=False)
 mealgraph.run(simulate=True, simulated_users=[...])
 ```
 
-### Full example
-
-```python
-import mealgraph
-
-api_keys = ["your_api_key1", "your_api_key2"]
-model_overrides = {
-    "main": {"model_name": "gemini-pro-latest", "params": {"temperature": 0.5}},
-}
-
-mealgraph.logging("path/to/log/dir")
-mealgraph.create_llm_instances(api_keys, model_overrides, enable_rate_limiting=True)
-mealgraph.initialize_tools()
-mealgraph.initialize_agents()
-mealgraph.setup_workflow()
-mealgraph.run(simulate=False)
-```
-
 ## Behaviour notes
 
 * **User mode output** — high-level progress lines, one per agent / tool
   action.
 * **Debug mode output** — raw LLM input / output (or output only),
-  scoped per agent / tool.
-* **API-key pooling** — the manager rotates keys and (when rate limiting
-  is on) enforces per-model RPM / RPD. Keys that exhaust their daily
-  quota are dropped from the pool until the next UTC day. Wait windows
-  are computed *after* the response completes so generation time does
-  not count against the budget. If every key is currently saturated,
-  the next call sleeps until the earliest slot frees up.
+  scoped per agent / tool. Enable with `mealgraph.debug(level='full',
+  scopes={'agents': ['CoachAgent'], 'tools': ['all']})`.
+* **API-key pooling** — the manager rotates keys and (when rate
+  limiting is on) enforces per-model RPM / RPD. Keys that exhaust their
+  daily quota are dropped from the pool until the next UTC day.
 * **Interactive mode** — prompts for profile fields, then accepts free
   questions; type `exit` to quit.
 * **Simulation mode** — each entry in `simulated_users` is a dict with
   `user_profile`, `medical_history`, and `questions`; the loop drives
   each user's questions sequentially.
-* **Error handling** — provide at least one API key (else `ValueError`).
-  Each initialisation function checks that its predecessor has been
-  called.
+* **Error handling** — provide at least one API key (else
+  `ValueError`). Each initialisation function checks that its
+  predecessor has been called.

@@ -51,7 +51,7 @@ class AgentCard(BaseModel):
     role: str = Field(
         description=(
             "Free-text role label, e.g. 'orchestrator', 'specialist:medical', "
-            "'specialist:nutrition_planning', 'critic', 'retrieval'."
+            "'specialist:nutrition_planning'."
         )
     )
     capabilities: List[Capability]
@@ -120,47 +120,33 @@ def default_cards() -> List[AgentCard]:
         ),
         AgentCard(
             name="PlannerAgent",
-            description="Personalised meal plans constrained by the medical assessment.",
+            description=(
+                "Personalised meal plans constrained by the medical assessment. "
+                "Runs an internal deterministic check (allergy / calorie / macro "
+                "tolerances) after the LP solver and self-revises up to twice "
+                "before returning."
+            ),
             role="specialist:nutrition_planning",
             capabilities=[
                 Capability(
                     name="plan_meals",
                     description=(
-                        "Draft a plan, batch-fetch nutrition facts, run QuantitiesFinder LP, "
-                        "finalise."
+                        "Draft a plan, batch-fetch nutrition facts via grounded "
+                        "WebSearchTool, run the PuLP QuantitiesFinder LP, run "
+                        "check_plan(), revise on medium/high issues, finalise."
                     ),
                     input=CapabilityIO(description="task: str, memory: dict"),
-                    output=CapabilityIO(description="JSON-serialised final_plan or error payload"),
-                    side_effects=["memory.plans"],
-                )
-            ],
-        ),
-        AgentCard(
-            name="ValidationAgent",
-            description="Critic: deterministic + LLM-graded checks; can demand revision or reject.",
-            role="critic",
-            capabilities=[
-                Capability(
-                    name="validate_plan",
-                    description="Grade memory.plans.current_plan; return ValidationDecision.",
-                    input=CapabilityIO(description="task: str, memory: dict"),
-                    output=CapabilityIO(description="ValidationDecision JSON"),
-                    side_effects=["memory.flags_and_assessments.last_validation"],
-                )
-            ],
-        ),
-        AgentCard(
-            name="KnowledgeAgent",
-            description="Citation-first retrieval (USDA / WHO / ADA / EFSA via biased web search).",
-            role="retrieval",
-            capabilities=[
-                Capability(
-                    name="lookup",
-                    description="Answer 'kind' x 'query' with at least one source URL.",
-                    input=CapabilityIO(
-                        description='task: JSON {"kind": "nutrition"|"guideline"|"drug_interaction"|"general", "query": "..."}',
+                    output=CapabilityIO(
+                        description=(
+                            'JSON envelope {"plan": {...}, "revisions": N, '
+                            '"unresolved_issues": [...]} or {"error": "..."}'
+                        )
                     ),
-                    output=CapabilityIO(description='JSON {"answer": "...", "citations": [url, ...]}'),
+                    side_effects=[
+                        "memory.plans.current_plan",
+                        "memory.plans.revision_count",
+                        "memory.plans.post_lp_issues",
+                    ],
                 )
             ],
         ),

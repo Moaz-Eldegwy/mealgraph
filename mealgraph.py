@@ -7,13 +7,11 @@ from IPython.display import Markdown, display
 
 from agents import CoachAgent, MedicalAssessmentAgent, PlannerAgent
 from config import set_settings
-from knowledge import KnowledgeAgent
 from logging_setup import get_logger, refresh_level
 from memory import LongTermMemory
 from state import initialize_empty_memory
-from tools import ComputationTool, QuantitiesFinder, WebSearchTool
+from tools import QuantitiesFinder, WebSearchTool
 from utils import APIPoolManager, create_llm
-from validation import ValidationAgent
 from workflow import setup_workflow as setup_workflow_workflow
 
 _logger = get_logger("mealgraph")
@@ -24,7 +22,7 @@ def debug(level: str = "full", scopes: Optional[Dict[str, List[str]]] = None) ->
 
     Args:
         level: 'full' (default) to show inputs and outputs, or 'output' to show only outputs.
-        scopes: Optional dict like ``{'agents': ['all'], 'tools': ['ComputationTool']}``.
+        scopes: Optional dict like ``{'agents': ['all'], 'tools': ['QuantitiesFinder']}``.
                 If None, defaults to all agents and tools.
     """
     if scopes is None:
@@ -50,54 +48,51 @@ def logging(log_dir: Optional[str] = None, persistence_dir: Optional[str] = None
     if updates:
         set_settings(**updates)
 
-# Default model configurations (without API keys, as they will be provided by the user).
+
+# Default model configurations (without API keys, as they will be provided
+# by the user). Five LLM slots — no separate validation_agent any more
+# since the Validator was folded into the Planner / Coach.
+#
 # Targets the Gemini 3.x family via the rolling "*-latest" aliases:
-#   - gemini-pro-latest        (deep reasoning, Coach / Medical / Planner)
+#   - gemini-pro-latest        (deep reasoning: Coach / Medical / Planner)
 #   - gemini-flash-latest      (mid-tier; reserved for overrides)
-#   - gemini-flash-lite-latest (cheapest; validator + tools + sim)
+#   - gemini-flash-lite-latest (cheapest; tools + simulator)
 DEFAULT_MODEL_CONFIGS = {
     "main": {
         "type": "gemini",
         "model_name": "gemini-pro-latest",
         "structured_output": True,
         "thinking_budget": 600,
-        "params": {"max_tokens": 5120, "temperature": 0.3}
+        "params": {"max_tokens": 5120, "temperature": 0.3},
     },
     "agents_llm": {
         "type": "gemini",
         "model_name": "gemini-pro-latest",
         "structured_output": True,
         "thinking_budget": 600,
-        "params": {"max_tokens": 5120, "temperature": 0.3}
-    },
-    "tools_llm": {
-        "type": "gemini",
-        "model_name": "gemini-flash-lite-latest",
-        "structured_output": False,
-        "thinking_budget": 600,
-        "params": {"max_tokens": 5120, "temperature": 0.3}
+        "params": {"max_tokens": 5120, "temperature": 0.3},
     },
     "planner_agent": {
         "type": "gemini",
         "model_name": "gemini-pro-latest",
         "structured_output": True,
         "thinking_budget": 600,
-        "params": {"max_tokens": 5120, "temperature": 0.3}
+        "params": {"max_tokens": 5120, "temperature": 0.3},
     },
-    "validation_agent": {
+    "tools_llm": {
         "type": "gemini",
         "model_name": "gemini-flash-lite-latest",
-        "structured_output": True,
-        "thinking_budget": 300,
-        "params": {"max_tokens": 3072, "temperature": 0.2}
+        "structured_output": False,
+        "thinking_budget": 600,
+        "params": {"max_tokens": 5120, "temperature": 0.3},
     },
     "user_simulator": {
         "type": "gemini",
         "model_name": "gemini-flash-lite-latest",
         "structured_output": False,
         "thinking_budget": 300,
-        "params": {"max_tokens": 5120, "temperature": 0.5}
-    }
+        "params": {"max_tokens": 5120, "temperature": 0.5},
+    },
 }
 
 
@@ -107,9 +102,14 @@ TOOLS = None
 AGENTS = None
 APP = None
 
-def create_llm_instances(api_keys: list[str], model_overrides: Optional[Dict[str, Any]] = None, enable_rate_limiting: bool = True):
+
+def create_llm_instances(
+    api_keys: list[str],
+    model_overrides: Optional[Dict[str, Any]] = None,
+    enable_rate_limiting: bool = True,
+):
     """Create LLM instances using provided API keys list and optional model overrides.
-    
+
     Args:
         api_keys: List of API keys to cycle through.
         model_overrides: Optional overrides for model configs.
@@ -120,9 +120,6 @@ def create_llm_instances(api_keys: list[str], model_overrides: Optional[Dict[str
         raise ValueError("At least one API key must be provided.")
 
     if enable_rate_limiting:
-        # Free-tier RPM/RPD per Gemini 3.x rolling alias. Conservative
-        # numbers — tighten or widen via the override path if you have a
-        # paid quota.
         rate_limits = {
             "gemini-pro-latest": (5, 100),
             "gemini-flash-latest": (10, 250),
@@ -154,11 +151,11 @@ def create_llm_instances(api_keys: list[str], model_overrides: Optional[Dict[str
     LLM_INSTANCES = {
         "main": create_llm(model_configs["main"], manager),
         "agents_llm": create_llm(model_configs["agents_llm"], manager),
-        "tools_llm": create_llm(model_configs["tools_llm"], manager),
         "planner_agent": create_llm(model_configs["planner_agent"], manager),
-        "validation_agent": create_llm(model_configs["validation_agent"], manager),
+        "tools_llm": create_llm(model_configs["tools_llm"], manager),
         "user_simulator": create_llm(model_configs["user_simulator"], manager),
     }
+
 
 def initialize_tools():
     """Initialize tools using the LLM instances."""
@@ -167,10 +164,10 @@ def initialize_tools():
         raise RuntimeError("LLM instances must be created before initializing tools.")
     TOOLS_LLM = LLM_INSTANCES["tools_llm"]
     TOOLS = {
-        "ComputationTool": ComputationTool(TOOLS_LLM),
         "WebSearchTool": WebSearchTool(TOOLS_LLM),
-        "QuantitiesFinder": QuantitiesFinder()
+        "QuantitiesFinder": QuantitiesFinder(),
     }
+
 
 def initialize_agents():
     """Initialize agents using the LLM instances and tools."""
@@ -180,20 +177,14 @@ def initialize_agents():
     MAIN_LLM = LLM_INSTANCES["main"]
     AGENTS_LLM = LLM_INSTANCES["agents_llm"]
     PLANNER_LLM = LLM_INSTANCES["planner_agent"]
-    VALIDATION_LLM = LLM_INSTANCES["validation_agent"]
     AGENTS = {
         "CoachAgent": CoachAgent(MAIN_LLM),
         "MedicalAssessmentAgent": MedicalAssessmentAgent(
-            AGENTS_LLM, TOOLS["ComputationTool"], TOOLS["WebSearchTool"]
+            AGENTS_LLM, TOOLS["WebSearchTool"]
         ),
         "PlannerAgent": PlannerAgent(
-            PLANNER_LLM, TOOLS["ComputationTool"], TOOLS["WebSearchTool"], TOOLS["QuantitiesFinder"]
+            PLANNER_LLM, TOOLS["WebSearchTool"], TOOLS["QuantitiesFinder"]
         ),
-        "ValidationAgent": ValidationAgent(VALIDATION_LLM),
-        # Citation-first retrieval seam; default backing is WebSearch. A
-        # RAG-backed implementation over USDA / WHO / ADA / EFSA can swap
-        # in without touching the Coach call sites.
-        "KnowledgeAgent": KnowledgeAgent(TOOLS["WebSearchTool"]),
     }
 
 
@@ -214,18 +205,20 @@ def initialize_long_term_memory(db_path: Optional[str] = None) -> LongTermMemory
     _logger.info("Long-term memory initialised at %s", db_path or ":memory:")
     return LONG_TERM_MEMORY
 
+
 def setup_workflow():
     global APP
     if AGENTS is None or TOOLS is None:
         raise RuntimeError("Agents and tools must be initialized before setting up workflow.")
     APP = setup_workflow_workflow(AGENTS["CoachAgent"], AGENTS, TOOLS)
 
+
 class UserSimulator:
     def __init__(self, llm, user_profile, medical_history):
         self.llm = llm
         self.user_data = {
             "user_profile": user_profile,
-            "medical_history": medical_history
+            "medical_history": medical_history,
         }
 
     def get_response(self, assistant_message):
@@ -241,6 +234,7 @@ class UserSimulator:
         response = self.llm(sim_prompt)[0]
         return response
 
+
 def initialize_user_data():
     """Collect user information interactively to initialize memory."""
     print("Let's collect some information about you to personalize your experience.")
@@ -253,16 +247,27 @@ def initialize_user_data():
     weight = float(input("What is your weight? (in kg) "))
 
     print("\nNext, about your lifestyle and goals:")
-    activity_level = input("What is your activity level? (e.g., sedentary, lightly active, moderately active, very active, extra active) ")
-    goal = input("What is your primary goal? (e.g., lose weight, maintain weight, gain muscle) ")
+    activity_level = input(
+        "What is your activity level? (e.g., sedentary, lightly active, "
+        "moderately active, very active, extra active) "
+    )
+    goal = input(
+        "What is your primary goal? (e.g., lose weight, maintain weight, gain muscle) "
+    )
     job = input("What is your job or daily routine? ")
 
     print("\nDietary preferences:")
-    dietary_restrictions = input("Any dietary restrictions? (e.g., vegetarian, vegan, keto) ")
+    dietary_restrictions = input(
+        "Any dietary restrictions? (e.g., vegetarian, vegan, keto) "
+    )
     food_likes = input("Favorite foods? ")
     food_dislikes = input("Foods you dislike? ")
     allergies_input = input("Any allergies? (comma-separated) ")
-    allergies_list = [a.strip() for a in allergies_input.split(",") if a.strip()] if allergies_input else []
+    allergies_list = (
+        [a.strip() for a in allergies_input.split(",") if a.strip()]
+        if allergies_input
+        else []
+    )
 
     print("\nLocation and budget:")
     country = input("Which country are you in? ")
@@ -270,11 +275,23 @@ def initialize_user_data():
 
     print("\nMedical history:")
     conditions_input = input("Any medical conditions? (comma-separated) ")
-    conditions_list = [c.strip() for c in conditions_input.split(",") if c.strip()] if conditions_input else []
+    conditions_list = (
+        [c.strip() for c in conditions_input.split(",") if c.strip()]
+        if conditions_input
+        else []
+    )
     medications_input = input("Current medications? (comma-separated) ")
-    medications_list = [m.strip() for m in medications_input.split(",") if m.strip()] if medications_input else []
+    medications_list = (
+        [m.strip() for m in medications_input.split(",") if m.strip()]
+        if medications_input
+        else []
+    )
     past_issues_input = input("Past health issues? (comma-separated) ")
-    past_issues_list = [p.strip() for p in past_issues_input.split(",") if p.strip()] if past_issues_input else []
+    past_issues_list = (
+        [p.strip() for p in past_issues_input.split(",") if p.strip()]
+        if past_issues_input
+        else []
+    )
     lab_results = input("Any recent lab results? (e.g., cholesterol levels) ")
 
     user_profile = {
@@ -292,7 +309,7 @@ def initialize_user_data():
         "allergies": allergies_list,
         "country": country,
         "currency": currency,
-        "last_updated": datetime.now().isoformat()
+        "last_updated": datetime.now().isoformat(),
     }
 
     medical_history = {
@@ -300,7 +317,7 @@ def initialize_user_data():
         "medications": medications_list,
         "past_issues": past_issues_list,
         "lab_results": lab_results,
-        "last_updated": datetime.now().isoformat()
+        "last_updated": datetime.now().isoformat(),
     }
 
     memory = initialize_empty_memory()
@@ -309,53 +326,65 @@ def initialize_user_data():
 
     return memory
 
+
 def run(simulate=False, simulated_users=None):
     """Run the system in either simulation or interactive mode."""
     if APP is None:
         raise RuntimeError("Workflow must be set up before running the system.")
 
     if simulate:
-        print("\n" + "="*80)
+        print("\n" + "=" * 80)
         print("STARTING SIMULATION MODE")
-        print("="*80)
+        print("=" * 80)
         if not simulated_users:
             raise ValueError("simulated_users must be provided when simulate=True")
 
         for user in simulated_users:
             print(f"\nProcessing user: {user['user_profile']['name']}")
-            user["user_profile"]["last_updated"]  = datetime.now().isoformat()
+            user["user_profile"]["last_updated"] = datetime.now().isoformat()
             user["medical_history"]["last_updated"] = datetime.now().isoformat()
             memory = {
-                "user_profile":       user["user_profile"],
-                "medical_history":    user["medical_history"],
+                "user_profile": user["user_profile"],
+                "medical_history": user["medical_history"],
                 "flags_and_assessments": {},
-                "plans": {}
+                "plans": {},
             }
             conversation_history = []
             previous_actions = []
-            user_simulator = UserSimulator(LLM_INSTANCES["user_simulator"], user["user_profile"], user["medical_history"])
+            user_simulator = UserSimulator(
+                LLM_INSTANCES["user_simulator"],
+                user["user_profile"],
+                user["medical_history"],
+            )
             for question in user["questions"]:
                 print(f"\n🙍🏻‍♂️Asking: {question}")
                 state = {
                     "memory": memory,
                     "user_question": question,
-                    "conversation_history": conversation_history + [{"role": "user", "content": question}],
+                    "conversation_history": conversation_history
+                    + [{"role": "user", "content": question}],
                     "current_action": None,
                     "agent_result": None,
                     "num_turns": 0,
                     "max_turns": 10,
                     "previous_actions": previous_actions,
-                    "response_steps": []
+                    "response_steps": [],
                 }
                 while True:
-                    final_state = APP.invoke(state, config={"configurable": {"thread_id": f"user_{user['user_profile']['name']}"}})
+                    final_state = APP.invoke(
+                        state,
+                        config={
+                            "configurable": {
+                                "thread_id": f"user_{user['user_profile']['name']}"
+                            }
+                        },
+                    )
                     if final_state["num_turns"] >= final_state["max_turns"]:
                         print("Max turns reached without composing a response.")
                         break
                     last_action = final_state["current_action"]["action"]
                     if last_action == "compose_response":
                         print(f"\n{'='*60}")
-                        # print(f"**Answer:**\n\n{final_state['agent_result']}")
                         display(Markdown(f"**Answer:**\n\n{final_state['agent_result']}"))
                         conversation_history = final_state["conversation_history"]
                         memory = final_state["memory"]
@@ -369,26 +398,27 @@ def run(simulate=False, simulated_users=None):
                         state = {
                             "memory": memory,
                             "user_question": question,
-                            "conversation_history": conversation_history + [{"role": "user", "content": question}],
+                            "conversation_history": conversation_history
+                            + [{"role": "user", "content": question}],
                             "current_action": None,
                             "agent_result": None,
                             "num_turns": 0,
                             "max_turns": 10,
                             "previous_actions": previous_actions,
-                            "response_steps": [] 
+                            "response_steps": [],
                         }
                     else:
                         print(f"Unexpected action: {last_action}")
                         break
     else:
-        print("\n" + "="*80)
+        print("\n" + "=" * 80)
         print("STARTING INTERACTIVE MODE")
-        print("="*80)
+        print("=" * 80)
         memory = initialize_user_data()
 
-        print("\n" + "="*80)
+        print("\n" + "=" * 80)
         print("WELCOME TO THE NUTRITION APP")
-        print("="*80)
+        print("=" * 80)
 
         initial_state = {
             "memory": memory,
@@ -399,7 +429,7 @@ def run(simulate=False, simulated_users=None):
             "num_turns": 0,
             "max_turns": 10,
             "previous_actions": [],
-            "response_steps": []
+            "response_steps": [],
         }
 
         final_state = APP.invoke(initial_state, config={"configurable": {"thread_id": "user1"}})
@@ -411,19 +441,20 @@ def run(simulate=False, simulated_users=None):
 
         while True:
             q = input("\n❓ Your question: ")
-            if q.lower() == 'exit':
+            if q.lower() == "exit":
                 break
 
             state = {
                 "memory": final_state["memory"],
                 "user_question": q,
-                "conversation_history": final_state["conversation_history"] + [{"role": "user", "content": q}],
+                "conversation_history": final_state["conversation_history"]
+                + [{"role": "user", "content": q}],
                 "current_action": None,
                 "agent_result": None,
                 "num_turns": 0,
                 "max_turns": 10,
                 "previous_actions": final_state["previous_actions"],
-                "response_steps": []  
+                "response_steps": [],
             }
 
             final_state = APP.invoke(state, config={"configurable": {"thread_id": "user1"}})

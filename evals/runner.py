@@ -2,32 +2,30 @@
 
 Validates the *deterministic* parts of the system end-to-end without paying
 for Gemini calls. Walks each fixture, builds the calculations the Medical
-agent would emit, runs the Validator over a hand-built plan, and asserts
-that the per-fixture ``expected`` dict matches.
+agent would emit, runs :func:`agents.check_plan` over a hand-built plan,
+and asserts that the per-fixture ``expected`` dict matches.
+
+This is the same ``check_plan`` the Planner runs internally after the LP
+solver — keeping the eval surface aligned with production behaviour.
 
 Two ways to invoke:
 
 * As a script: ``python -m evals.runner`` -> prints a per-fixture report.
 * From pytest: imported and called by ``tests/test_evals.py``.
-
-When real Gemini keys are present and ``--live`` is passed, the runner
-swaps the MockLLM for a real one. That path is opt-in so CI never hits
-the API by accident.
 """
 
 from __future__ import annotations
 
-import json
 import sys
 from dataclasses import dataclass, field
 from typing import Any, Dict, List
 
+from agents import check_plan
 from evals.fixtures import all_fixtures
 from guardrails import detect_prompt_injection
 from nutrition_formulas import full_assessment
 from observability import get_metrics
 from utils import get_parse_metrics
-from validation import ValidationAgent
 
 
 @dataclass
@@ -54,7 +52,6 @@ def _build_plan_from_assessment(assessment: Dict[str, Any]) -> Dict[str, Any]:
     """Hand-build a plan that hits the assessment targets within tolerance."""
     target_cal = assessment["daily_target_calories"]
     macros = assessment["macro_targets"]
-    # Single-row plan: nutrient totals = full daily target.
     return {
         "days": [
             {
@@ -69,21 +66,11 @@ def _build_plan_from_assessment(assessment: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-class _PassThroughLLM:
-    """LLM stub for the Validator's LLM layer; emits 'pass' verdicts."""
-
-    def call_typed(self, _prompt: str, response_model):  # noqa: ANN001
-        from schemas import ValidationDecision
-
-        if response_model is ValidationDecision:
-            return ValidationDecision(verdict="pass", issues=[], notes="eval-stub")
-        return None
-
-
 def _check_expected(
     fixture: Dict[str, Any],
     assessment: Dict[str, Any],
-    validation_decision: Dict[str, Any],
+    issues: List[Dict[str, Any]],
+    requires_human_review: bool,
 ) -> List[str]:
     failures: List[str] = []
     expected = fixture.get("expected", {})
@@ -101,10 +88,16 @@ def _check_expected(
                 f"protein_g {actual} below expected min {expected['min_protein_g']}"
             )
 
-    if expected.get("requires_human_review") and not validation_decision.get(
-        "requires_human_review"
-    ):
+    if expected.get("requires_human_review") and not requires_human_review:
         failures.append("expected requires_human_review=True")
+
+    # No deterministic issue should fire for a hand-built plan that hits
+    # targets exactly — if one does, the check_plan contract has drifted.
+    if issues:
+        failures.append(
+            f"unexpected post-LP issues on a target-hitting plan: "
+            f"{[i['code'] for i in issues]}"
+        )
 
     return failures
 
@@ -115,6 +108,7 @@ def run_offline() -> List[FixtureResult]:
         name = fixture["user_profile"]["name"]
 
         # 1. Sanity-check the user-question for prompt injection.
+        injected = False
         for q in fixture["questions"]:
             verdict = detect_prompt_injection(q)
             if verdict.is_attempt:
@@ -122,16 +116,23 @@ def run_offline() -> List[FixtureResult]:
                     FixtureResult(
                         name=name,
                         passed=False,
-                        failures=[f"fixture question flagged as injection: {verdict.matches}"],
+                        failures=[
+                            f"fixture question flagged as injection: {verdict.matches}"
+                        ],
                     )
                 )
-                continue
+                injected = True
+                break
+        if injected:
+            continue
 
         # 2. Compute the assessment deterministically.
         assessment = _build_assessment(fixture)
 
-        # 3. Hand-build a plan that hits targets and run the Validator.
+        # 3. Hand-build a plan that hits targets and run the deterministic
+        #    plan check — the same code the Planner runs internally.
         plan = _build_plan_from_assessment(assessment)
+        requires_human_review = fixture["expected"].get("requires_human_review", False)
         memory: Dict[str, Any] = {
             "user_profile": fixture["user_profile"],
             "medical_history": fixture["medical_history"],
@@ -140,18 +141,14 @@ def run_offline() -> List[FixtureResult]:
                 "calculations": assessment,
                 "flags": fixture["medical_history"]["conditions"],
                 "recommendations": [],
-                "requires_professional_consultation": fixture["expected"].get(
-                    "requires_human_review", False
-                ),
+                "requires_professional_consultation": requires_human_review,
             },
             "plans": {"current_plan": plan},
         }
 
-        validator = ValidationAgent(_PassThroughLLM())
-        decision_json = validator.handle_task("eval", memory)
-        decision = json.loads(decision_json)
+        issues = check_plan(plan, memory)
 
-        failures = _check_expected(fixture, assessment, decision)
+        failures = _check_expected(fixture, assessment, issues, requires_human_review)
         results.append(
             FixtureResult(
                 name=name,
@@ -160,8 +157,8 @@ def run_offline() -> List[FixtureResult]:
                 info={
                     "calories": assessment["daily_target_calories"],
                     "protein_g": assessment["macro_targets"]["protein_g"],
-                    "verdict": decision["verdict"],
-                    "issues": [i["code"] for i in decision["issues"]],
+                    "issues": [i["code"] for i in issues],
+                    "requires_human_review": requires_human_review,
                 },
             )
         )

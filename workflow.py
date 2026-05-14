@@ -75,15 +75,6 @@ def execute_action_node(state: NutritionState, agents: Dict[str, Any], tools: Di
             state["previous_actions"].append(f"Called agent {agent_name} with task: {task}")
             return {**state, "agent_result": success_message}
 
-        if action_name == "call_tool":
-            tool_name = params["tool_name"]
-            task = params["task"]
-            tool_result = (
-                tools[tool_name].handle_task(task) if tool_name in tools else f"Unknown tool: {tool_name}"
-            )
-            state["previous_actions"].append(f"Called tool {tool_name} with task: {task}")
-            return {**state, "agent_result": tool_result}
-
         if action_name == "write_memory":
             partition = params["partition"]
             raw_data = params["data"]
